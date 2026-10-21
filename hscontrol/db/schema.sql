@@ -38,6 +38,17 @@ CREATE UNIQUE INDEX idx_provider_identifier ON users(provider_identifier) WHERE 
 CREATE UNIQUE INDEX idx_name_provider_identifier ON users(name, provider_identifier);
 CREATE UNIQUE INDEX idx_name_no_provider_identifier ON users(name) WHERE provider_identifier IS NULL;
 
+CREATE TABLE local_credentials (
+  user_id bigint PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  password_hash text NOT NULL
+);
+
+CREATE TABLE local_invitations (
+  user_id bigint PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  token_hash text NOT NULL UNIQUE,
+  expires_at timestamp NOT NULL
+);
+
 CREATE TABLE pre_auth_keys(
   id integer PRIMARY KEY AUTOINCREMENT,
   key text,

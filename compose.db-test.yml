@@ -1,0 +1,10 @@
+services:
+  db-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.db-test
+    init: true
+    user: postgres
+    environment:
+      LC_ALL: en_US.UTF-8
+      LC_CTYPE: en_US.UTF-8

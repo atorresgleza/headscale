@@ -1,0 +1,46 @@
+# Local password authentication (fork design)
+
+Status: draft for review; not implemented or approved for deployment. This fork aims for upstream-quality evidence but is not submitting this feature upstream. No SMTP service is assumed.
+
+## Use case and ownership
+
+An administrator uses an existing Headscale user (created with the current user-management interface and optionally already carrying an email). The administrator generates a time-limited invitation URL for that user's immutable ID and delivers it manually through a trusted channel. The user follows that URL to set an initial password. Later, `tailscale up --login-server ...` presents a pending device registration URL; the user authenticates and explicitly approves that device under their account. The fork operator owns security updates, tests, documentation, and future maintenance.
+
+This is an alternative to administrator CLI approval, not a replacement for the existing CLI or OIDC paths. Google/OIDC login is a later, separately designed phase. No email is sent or verified by this version. Invitation issuance does not create users, assign or update email, or alter `User.Username()`; it binds to an existing user ID. Headscale already prefers `User.Email` over `User.Name` for policy-facing identity, and this feature must preserve that behavior. Email is not proof of ownership merely because it is populated.
+
+## Trust boundaries and flow
+
+1. An administrator selects an existing user using the existing user-management interface. A separate privileged action issues an invitation bound to that user's ID without mutating their email or identity. The action displays the URL once; it must not accept a password in shell arguments or write the URL to routine logs.
+2. The invitation is a 32-byte cryptographically random bearer secret, stored only as a SHA-256 digest with its user ID and expiration. Default lifetime is 24 hours (maximum 7 days); replacement invalidates the previous outstanding invitation. A successful enrollment atomically consumes the invitation. Issuing a replacement invalidates earlier outstanding invitations for that user. Delivery is manual until a separately reviewed SMTP design exists. Use an invitation URL with the secret in the fragment (not the request path or query); same-origin enrollment code removes the fragment from browser history immediately and exchanges it in a body-limited POST with CSRF protection. Never load third-party scripts on that page or log request bodies/tokens; audit server and reverse-proxy logging before release.
+3. Opening the invitation leads to password enrollment, not automatic node approval. A valid invitation may be consumed only once, transactionally with storing the credential. Rejected, expired, revoked, and already-used links must not change the credential or invitation state. No password or token may appear in a logged URL or retained browser history.
+4. Store password verifiers separately from the public `User` representation. Use Argon2id with a unique salt and versioned parameters (at least 19 MiB, two iterations, parallelism one, subject to deployment calibration). Accept passwords of 15 to 1024 UTF-8 bytes without trimming or silent normalization; reject oversized input before hashing and avoid logging secrets. Reset is administrator-initiated by issuing a fresh invitation; the old password remains valid until successful enrollment atomically replaces it, so an abandoned link does not lock out the user. A separately designed administrative disable action is required for a compromised password. A reset must not silently change existing node ownership. A reset must not silently change existing node ownership.
+5. The existing pending device auth ID remains distinct from the invitation token. The registration page accepts the auth ID created by `tailscale up`, authenticates the user, displays the device identity and requested tags, and requires an explicit POST confirmation. A copied invitation URL alone cannot register a device; a successful login alone cannot confirm it either. Finalization uses the existing state registration transition and tag-owner authorization. An auth ID is one-shot and subject to the existing expiry.
+6. Limit credential guessing and invitation attempts across server instances, avoid account-existence disclosure in responses, and bind confirmation to a short-lived server-side state and CSRF protection. Serve credential and confirmation pages only under an HTTPS public origin; review reverse-proxy TLS termination before relying on `req.TLS` for Secure cookies. Avoid persistent browser sessions in the first release.
+
+## Compatibility and rollout
+
+Default behavior stays unchanged unless local authentication is explicitly enabled. Existing CLI registration and OIDC remain available in their existing configurations; coexistence with OIDC is out of scope until a separate design. Any new schema uses an append-only migration under the repository's foreign-key rules; no existing user password field or serialized API response acquires a secret. Disabled mode must not expose enrollment or login endpoints. Deployment needs a separate decision, backup and rollback instructions, and an HTTPS/reverse-proxy check.
+
+## Local database test runner
+
+The database package uses `postgrestest`, which starts a temporary PostgreSQL server by invoking `initdb` inside the **test process's** environment. A separate PostgreSQL Compose service does not exercise that code path. To run the first work unit without installing PostgreSQL on the host, build and run the isolated, unprivileged test container:
+
+```sh
+docker compose -f compose.db-test.yml build db-test
+docker compose -f compose.db-test.yml run --rm db-test
+```
+
+The first command compiles the package test binary in the image; the second runs all `TestLocalInvitation*` tests against disposable SQLite databases and ephemeral PostgreSQL instances. The PostgreSQL cases cover concurrent redemption and an isolated upgrade from the immediately preceding schema while preserving an existing user. Require a `PASS`, **no `SKIP` for either PostgreSQL case**, and exit code zero. This does not start or migrate a production server, create a published image, or authorize deployment. Do not run Docker cleanup/prune commands as part of this workflow.
+
+## Evidence required before release
+
+- Unit tests: invitation issuance/replacement/revocation/expiry/replay, rejected operations preserving credential and invitation state, password setup/reset and wrong-password handling, unknown users, user deletion, and no secrets in outputs or logs.
+- HTTP tests: unauthenticated requests, CSRF, generic errors, input limits, cookie security, repeated POSTs, expired pending auth IDs, requested tags, reauthentication and cross-user denial. Prove the legacy CLI and OIDC routes are unchanged.
+- Isolated end-to-end tests: create user and invitation, enroll, register a device, reject a replay, revoke/reset access, and confirm the device is attributed correctly. Follow `cmd/hi/README.md` and `integration/README.md` before authoring or running those tests.
+- Documentation: operator setup, manual invitation delivery, HTTPS requirements, admin recovery, disable/rollback, and maintenance responsibilities. Update user-facing registration docs and changelog with implementation, not before.
+
+## Open implementation decisions
+
+Before exposing HTTP routes, choose distributed rate-limit keys/storage and fail-closed behavior, trusted HTTPS origin and Secure-cookie behavior behind reverse proxies, rehash/upgrade policy, and configuration surface after examining existing conventions. Browser login initially uses the exact existing local `User.Name` and never an email alias or an OIDC-only account. The first persistence work unit has no public HTTP or CLI route; it does not yet claim protection against online guessing. None of these choices should be inferred to be already implemented. Preserve the existing email-as-identity/policy behavior; neither adding contact fields nor changing email assignment belongs to this feature. Do not add email-based login or automated delivery by assumption.
+
+Security baseline: [OWASP Password Storage](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html), [Authentication](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html), and [Forgot Password](https://cheatsheetseries.owasp.org/cheatsheets/Forgot_Password_Cheat_Sheet.html) cheat sheets. Values above are an initial fork policy, not an OWASP mandate for token lifetime or maximum Argon2id input size.

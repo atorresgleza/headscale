@@ -1,0 +1,25 @@
+# Local database tests need initdb and pg_ctl in the same container as the Go tests.
+FROM docker.io/golang:1.26.5-trixie
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends postgresql locales \
+    && sed -i 's/^# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
+    && locale-gen en_US.UTF-8 \
+    && bindir="$(dirname "$(find /usr/lib/postgresql -type f -name initdb -print -quit)")" \
+    && test -x "$bindir/initdb" \
+    && ln -s "$bindir" /opt/postgresql-bin \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/opt/postgresql-bin:${PATH}" \
+    LC_ALL=en_US.UTF-8 \
+    LC_CTYPE=en_US.UTF-8
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN go test -c -o /usr/local/bin/headscale-db.test ./hscontrol/db
+
+WORKDIR /src/hscontrol/db
+USER postgres
+CMD ["/usr/local/bin/headscale-db.test", "-test.v", "-test.count=1", "-test.run=^TestLocalInvitation"]

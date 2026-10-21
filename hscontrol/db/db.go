@@ -808,6 +808,13 @@ WHERE tags IS NOT NULL AND tags != '[]' AND tags != '' AND tags != 'null'
 				},
 				Rollback: func(db *gorm.DB) error { return nil },
 			},
+			{
+				ID: "202610211200-local-password-auth-tables",
+				Migrate: func(tx *gorm.DB) error {
+					return createLocalAuthTables(tx)
+				},
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
 		},
 	)
 
@@ -821,6 +828,10 @@ WHERE tags IS NOT NULL AND tags != '[]' AND tags != '' AND tags != 'null'
 			&types.Policy{},
 		)
 		if err != nil {
+			return err
+		}
+
+		if err := createLocalAuthTables(tx); err != nil {
 			return err
 		}
 
