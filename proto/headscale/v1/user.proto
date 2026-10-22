@@ -42,3 +42,15 @@ message ListUsersRequest {
 }
 
 message ListUsersResponse { repeated User users = 1; }
+
+// IssueLocalInvitation is an administrator action for an existing local user.
+message IssueLocalInvitationRequest {
+  uint64 user_id = 1;
+  // Zero uses the server default of 24 hours; the maximum is 7 days.
+  uint64 lifetime_seconds = 2;
+}
+
+message IssueLocalInvitationResponse {
+  // Bearer secret returned only at issuance. Never log or persist this value.
+  string token = 1;
+}

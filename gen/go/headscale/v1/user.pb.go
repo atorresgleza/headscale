@@ -514,6 +514,105 @@ func (x *ListUsersResponse) GetUsers() []*User {
 	return nil
 }
 
+// IssueLocalInvitation is an administrator action for an existing local user.
+type IssueLocalInvitationRequest struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	UserId uint64                 `protobuf:"varint,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	// Zero uses the server default of 24 hours; the maximum is 7 days.
+	LifetimeSeconds uint64 `protobuf:"varint,2,opt,name=lifetime_seconds,json=lifetimeSeconds,proto3" json:"lifetime_seconds,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *IssueLocalInvitationRequest) Reset() {
+	*x = IssueLocalInvitationRequest{}
+	mi := &file_headscale_v1_user_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *IssueLocalInvitationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*IssueLocalInvitationRequest) ProtoMessage() {}
+
+func (x *IssueLocalInvitationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_headscale_v1_user_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use IssueLocalInvitationRequest.ProtoReflect.Descriptor instead.
+func (*IssueLocalInvitationRequest) Descriptor() ([]byte, []int) {
+	return file_headscale_v1_user_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *IssueLocalInvitationRequest) GetUserId() uint64 {
+	if x != nil {
+		return x.UserId
+	}
+	return 0
+}
+
+func (x *IssueLocalInvitationRequest) GetLifetimeSeconds() uint64 {
+	if x != nil {
+		return x.LifetimeSeconds
+	}
+	return 0
+}
+
+type IssueLocalInvitationResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Bearer secret returned only at issuance. Never log or persist this value.
+	Token         string `protobuf:"bytes,1,opt,name=token,proto3" json:"token,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *IssueLocalInvitationResponse) Reset() {
+	*x = IssueLocalInvitationResponse{}
+	mi := &file_headscale_v1_user_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *IssueLocalInvitationResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*IssueLocalInvitationResponse) ProtoMessage() {}
+
+func (x *IssueLocalInvitationResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_headscale_v1_user_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use IssueLocalInvitationResponse.ProtoReflect.Descriptor instead.
+func (*IssueLocalInvitationResponse) Descriptor() ([]byte, []int) {
+	return file_headscale_v1_user_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *IssueLocalInvitationResponse) GetToken() string {
+	if x != nil {
+		return x.Token
+	}
+	return ""
+}
+
 var File_headscale_v1_user_proto protoreflect.FileDescriptor
 
 const file_headscale_v1_user_proto_rawDesc = "" +
@@ -551,7 +650,12 @@ const file_headscale_v1_user_proto_rawDesc = "" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
 	"\x05email\x18\x03 \x01(\tR\x05email\"=\n" +
 	"\x11ListUsersResponse\x12(\n" +
-	"\x05users\x18\x01 \x03(\v2\x12.headscale.v1.UserR\x05usersB)Z'github.com/juanfont/headscale/gen/go/v1b\x06proto3"
+	"\x05users\x18\x01 \x03(\v2\x12.headscale.v1.UserR\x05users\"a\n" +
+	"\x1bIssueLocalInvitationRequest\x12\x17\n" +
+	"\auser_id\x18\x01 \x01(\x04R\x06userId\x12)\n" +
+	"\x10lifetime_seconds\x18\x02 \x01(\x04R\x0flifetimeSeconds\"4\n" +
+	"\x1cIssueLocalInvitationResponse\x12\x14\n" +
+	"\x05token\x18\x01 \x01(\tR\x05tokenB)Z'github.com/juanfont/headscale/gen/go/v1b\x06proto3"
 
 var (
 	file_headscale_v1_user_proto_rawDescOnce sync.Once
@@ -565,29 +669,31 @@ func file_headscale_v1_user_proto_rawDescGZIP() []byte {
 	return file_headscale_v1_user_proto_rawDescData
 }
 
-var file_headscale_v1_user_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_headscale_v1_user_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_headscale_v1_user_proto_goTypes = []any{
-	(*User)(nil),                  // 0: headscale.v1.User
-	(*CreateUserRequest)(nil),     // 1: headscale.v1.CreateUserRequest
-	(*CreateUserResponse)(nil),    // 2: headscale.v1.CreateUserResponse
-	(*RenameUserRequest)(nil),     // 3: headscale.v1.RenameUserRequest
-	(*RenameUserResponse)(nil),    // 4: headscale.v1.RenameUserResponse
-	(*DeleteUserRequest)(nil),     // 5: headscale.v1.DeleteUserRequest
-	(*DeleteUserResponse)(nil),    // 6: headscale.v1.DeleteUserResponse
-	(*ListUsersRequest)(nil),      // 7: headscale.v1.ListUsersRequest
-	(*ListUsersResponse)(nil),     // 8: headscale.v1.ListUsersResponse
-	(*timestamppb.Timestamp)(nil), // 9: google.protobuf.Timestamp
+	(*User)(nil),                         // 0: headscale.v1.User
+	(*CreateUserRequest)(nil),            // 1: headscale.v1.CreateUserRequest
+	(*CreateUserResponse)(nil),           // 2: headscale.v1.CreateUserResponse
+	(*RenameUserRequest)(nil),            // 3: headscale.v1.RenameUserRequest
+	(*RenameUserResponse)(nil),           // 4: headscale.v1.RenameUserResponse
+	(*DeleteUserRequest)(nil),            // 5: headscale.v1.DeleteUserRequest
+	(*DeleteUserResponse)(nil),           // 6: headscale.v1.DeleteUserResponse
+	(*ListUsersRequest)(nil),             // 7: headscale.v1.ListUsersRequest
+	(*ListUsersResponse)(nil),            // 8: headscale.v1.ListUsersResponse
+	(*IssueLocalInvitationRequest)(nil),  // 9: headscale.v1.IssueLocalInvitationRequest
+	(*IssueLocalInvitationResponse)(nil), // 10: headscale.v1.IssueLocalInvitationResponse
+	(*timestamppb.Timestamp)(nil),        // 11: google.protobuf.Timestamp
 }
 var file_headscale_v1_user_proto_depIdxs = []int32{
-	9, // 0: headscale.v1.User.created_at:type_name -> google.protobuf.Timestamp
-	0, // 1: headscale.v1.CreateUserResponse.user:type_name -> headscale.v1.User
-	0, // 2: headscale.v1.RenameUserResponse.user:type_name -> headscale.v1.User
-	0, // 3: headscale.v1.ListUsersResponse.users:type_name -> headscale.v1.User
-	4, // [4:4] is the sub-list for method output_type
-	4, // [4:4] is the sub-list for method input_type
-	4, // [4:4] is the sub-list for extension type_name
-	4, // [4:4] is the sub-list for extension extendee
-	0, // [0:4] is the sub-list for field type_name
+	11, // 0: headscale.v1.User.created_at:type_name -> google.protobuf.Timestamp
+	0,  // 1: headscale.v1.CreateUserResponse.user:type_name -> headscale.v1.User
+	0,  // 2: headscale.v1.RenameUserResponse.user:type_name -> headscale.v1.User
+	0,  // 3: headscale.v1.ListUsersResponse.users:type_name -> headscale.v1.User
+	4,  // [4:4] is the sub-list for method output_type
+	4,  // [4:4] is the sub-list for method input_type
+	4,  // [4:4] is the sub-list for extension type_name
+	4,  // [4:4] is the sub-list for extension extendee
+	0,  // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_headscale_v1_user_proto_init() }
@@ -601,7 +707,7 @@ func file_headscale_v1_user_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_headscale_v1_user_proto_rawDesc), len(file_headscale_v1_user_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   9,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

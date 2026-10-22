@@ -37,6 +37,10 @@ service HeadscaleService {
       get : "/api/v1/user"
     };
   }
+
+  // Administrator-only; never expose the invitation bearer secret in logs.
+  rpc IssueLocalInvitation(IssueLocalInvitationRequest)
+      returns (IssueLocalInvitationResponse) {}
   // --- User end ---
 
   // --- PreAuthKeys start ---
