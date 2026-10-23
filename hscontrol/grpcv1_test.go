@@ -2,10 +2,12 @@ package hscontrol
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	hsdb "github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -816,4 +818,94 @@ func TestDeleteApiKey_BothIdentifiers(t *testing.T) {
 	require.True(t, ok, "error should be a gRPC status error")
 	assert.Equal(t, codes.InvalidArgument, st.Code())
 	assert.Contains(t, st.Message(), "provide either id or prefix, not both")
+}
+
+// TestIssueLocalInvitation exercises issuance through the administrator RPC.
+func TestIssueLocalInvitation(t *testing.T) {
+	app := createTestApp(t)
+	api := newHeadscaleV1APIServer(app)
+	ctx := context.Background()
+
+	created, err := api.CreateUser(ctx, &v1.CreateUserRequest{
+		Name: "invited", Email: "invited@example.org",
+	})
+	require.NoError(t, err)
+	id := created.GetUser().GetId()
+	listed, err := api.ListUsers(ctx, &v1.ListUsersRequest{Id: id})
+	require.NoError(t, err)
+	require.Len(t, listed.GetUsers(), 1)
+	require.Equal(t, "invited@example.org", listed.GetUsers()[0].GetEmail())
+
+	issued, err := api.IssueLocalInvitation(ctx, &v1.IssueLocalInvitationRequest{UserId: id})
+	require.NoError(t, err)
+	require.NotEmpty(t, issued.GetToken())
+
+	oidc, err := app.state.DB().CreateUser(types.User{
+		Name: "external", ProviderIdentifier: sql.NullString{String: "issuer|subject", Valid: true},
+	})
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name    string
+		req     *v1.IssueLocalInvitationRequest
+		code    codes.Code
+		message string
+	}{
+		{
+			"missing user", &v1.IssueLocalInvitationRequest{},
+			codes.InvalidArgument, "user_id must be nonzero",
+		},
+		{
+			"lifetime too long",
+			&v1.IssueLocalInvitationRequest{UserId: id, LifetimeSeconds: 7*24*60*60 + 1},
+			codes.InvalidArgument, "lifetime_seconds must not exceed 604800",
+		},
+		{
+			"unknown user", &v1.IssueLocalInvitationRequest{UserId: id + 1000},
+			codes.NotFound, "local user not found",
+		},
+		{
+			"OIDC user", &v1.IssueLocalInvitationRequest{UserId: uint64(oidc.ID)},
+			codes.NotFound, "local user not found",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response, err := api.IssueLocalInvitation(ctx, tc.req)
+			require.Nil(t, response)
+			require.Equal(t, tc.code, status.Code(err))
+			require.Equal(t, tc.message, status.Convert(err).Message())
+		})
+	}
+
+	// Rejections must not rotate or consume the previously issued secret.
+	_, err = app.state.DB().RedeemLocalInvitation(issued.GetToken(), "correct horse battery staple")
+	require.NoError(t, err)
+	valid, err := app.state.DB().VerifyLocalPassword("invited", "correct horse battery staple")
+	require.NoError(t, err)
+	require.True(t, valid)
+
+	pending, err := api.IssueLocalInvitation(ctx, &v1.IssueLocalInvitationRequest{
+		UserId: id, LifetimeSeconds: 60 * 60,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, pending.GetToken())
+	replacement, err := api.IssueLocalInvitation(ctx, &v1.IssueLocalInvitationRequest{
+		UserId: id, LifetimeSeconds: 7 * 24 * 60 * 60,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, replacement.GetToken())
+	_, err = app.state.DB().RedeemLocalInvitation(pending.GetToken(), "another correct password")
+	require.ErrorIs(t, err, hsdb.ErrInvalidLocalInvitation)
+	_, err = app.state.DB().RedeemLocalInvitation(replacement.GetToken(), "another correct password")
+	require.NoError(t, err)
+	valid, err = app.state.DB().VerifyLocalPassword("invited", "correct horse battery staple")
+	require.NoError(t, err)
+	require.False(t, valid)
+	valid, err = app.state.DB().VerifyLocalPassword("invited", "another correct password")
+	require.NoError(t, err)
+	require.True(t, valid)
+	listed, err = api.ListUsers(ctx, &v1.ListUsersRequest{Id: id})
+	require.NoError(t, err)
+	require.Len(t, listed.GetUsers(), 1)
+	require.Equal(t, "invited@example.org", listed.GetUsers()[0].GetEmail())
 }

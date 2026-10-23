@@ -26,6 +26,7 @@ import (
 	"tailscale.com/types/views"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	hsdb "github.com/juanfont/headscale/hscontrol/db"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -64,6 +65,35 @@ func (api headscaleV1APIServer) CreateUser(
 	api.h.Change(policyChanged)
 
 	return &v1.CreateUserResponse{User: user.Proto()}, nil
+}
+
+// IssueLocalInvitation returns a bearer secret only to the privileged API caller.
+func (api headscaleV1APIServer) IssueLocalInvitation(
+	ctx context.Context,
+	request *v1.IssueLocalInvitationRequest,
+) (*v1.IssueLocalInvitationResponse, error) {
+	if request.GetUserId() == 0 {
+		return nil, status.Error(codes.InvalidArgument, "user_id must be nonzero")
+	}
+
+	const maxLifetimeSeconds = 7 * 24 * 60 * 60
+	lifetime := 24 * time.Hour
+	if seconds := request.GetLifetimeSeconds(); seconds != 0 {
+		if seconds > maxLifetimeSeconds {
+			return nil, status.Error(codes.InvalidArgument, "lifetime_seconds must not exceed 604800")
+		}
+		lifetime = time.Duration(seconds) * time.Second
+	}
+
+	token, err := api.h.state.IssueLocalInvitation(types.UserID(request.GetUserId()), lifetime)
+	if errors.Is(err, hsdb.ErrUserNotFound) {
+		return nil, status.Error(codes.NotFound, "local user not found")
+	}
+	if err != nil {
+		return nil, status.Error(codes.Internal, "issuing local invitation")
+	}
+
+	return &v1.IssueLocalInvitationResponse{Token: token}, nil
 }
 
 func (api headscaleV1APIServer) RenameUser(

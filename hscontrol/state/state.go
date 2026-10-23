@@ -493,6 +493,12 @@ func (s *State) RenameUser(userID types.UserID, newName string) (*types.User, ch
 	})
 }
 
+// IssueLocalInvitation issues a one-time enrollment secret for an existing local
+// user. Only privileged callers may expose the returned secret.
+func (s *State) IssueLocalInvitation(userID types.UserID, lifetime time.Duration) (string, error) {
+	return s.db.IssueLocalInvitation(userID, lifetime)
+}
+
 // GetUserByID retrieves a user by ID.
 func (s *State) GetUserByID(userID types.UserID) (*types.User, error) {
 	return s.db.GetUserByID(userID)
