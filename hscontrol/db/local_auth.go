@@ -269,6 +269,33 @@ func (hsdb *HSDatabase) VerifyLocalPassword(name, password string) (bool, error)
 	return verifyLocalHash(stored, password), nil
 }
 
+// AuthenticateLocalUser binds the verified password to the immutable ID from
+// the same credential row. A separate name lookup after verification could
+// authorize a different user if the name were reassigned in between.
+// HTTP callers must rate-limit before invoking this expensive check.
+func (hsdb *HSDatabase) AuthenticateLocalUser(name, password string) (types.UserID, bool, error) {
+	if len(password) > localPasswordMaxBytes || !utf8.ValidString(password) {
+		return 0, false, nil
+	}
+	var userID types.UserID
+	var stored string
+	err := hsdb.DB.Raw(`SELECT c.user_id, c.password_hash
+        FROM local_credentials c JOIN users u ON u.id = c.user_id
+        WHERE u.name = ? AND u.deleted_at IS NULL AND u.provider_identifier IS NULL`, name).
+		Row().Scan(&userID, &stored)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			_, dummyErr := hashLocalPassword("invalid account dummy password")
+			return 0, false, dummyErr
+		}
+		return 0, false, fmt.Errorf("reading local password verifier: %w", err)
+	}
+	if !verifyLocalHash(stored, password) {
+		return 0, false, nil
+	}
+	return userID, true, nil
+}
+
 func hashLocalPassword(password string) (string, error) {
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {

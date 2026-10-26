@@ -421,3 +421,27 @@ func TestLocalAuthAttemptBlockedRollsBackIP(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, allowed)
 }
+
+func TestAuthenticateLocalUserReturnsCredentialOwner(t *testing.T) {
+	database, err := newSQLiteTestDB()
+	require.NoError(t, err)
+	alice, err := database.CreateUser(types.User{Name: "alice", Email: "alice@example.org"})
+	require.NoError(t, err)
+	bob := database.CreateUserForTest("bob")
+	token, err := database.IssueLocalInvitation(types.UserID(alice.ID), time.Hour)
+	require.NoError(t, err)
+	_, err = database.RedeemLocalInvitation(token, "correct horse battery staple")
+	require.NoError(t, err)
+
+	uid, ok, err := database.AuthenticateLocalUser("alice", "correct horse battery staple")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, types.UserID(alice.ID), uid)
+	require.NotEqual(t, types.UserID(bob.ID), uid)
+	for _, pair := range [][2]string{{"alice", "wrong password"}, {"bob", "correct horse battery staple"}, {"unknown", "correct horse battery staple"}} {
+		uid, ok, err = database.AuthenticateLocalUser(pair[0], pair[1])
+		require.NoError(t, err)
+		require.False(t, ok)
+		require.Zero(t, uid)
+	}
+}
