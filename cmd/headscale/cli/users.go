@@ -2,10 +2,12 @@ package cli
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
+	"time"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
 	"github.com/juanfont/headscale/hscontrol/util"
@@ -13,6 +15,7 @@ import (
 	"github.com/pterm/pterm"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
 
 // CLI user errors.
@@ -51,6 +54,7 @@ func init() {
 	createUserCmd.Flags().StringP("email", "e", "", "Email")
 	createUserCmd.Flags().StringP("picture-url", "p", "", "Profile picture URL")
 	userCmd.AddCommand(listUsersCmd)
+	userCmd.AddCommand(inviteUserCmd)
 	usernameAndIDFlag(listUsersCmd)
 	listUsersCmd.Flags().StringP("email", "e", "", "Email")
 	userCmd.AddCommand(destroyUserCmd)
@@ -65,6 +69,84 @@ var userCmd = &cobra.Command{
 	Use:     "users",
 	Short:   "Manage the users of Headscale",
 	Aliases: []string{"user"},
+}
+
+type localInvitationOptions struct {
+	userID          uint64
+	lifetimeSeconds uint64
+	origin          string
+}
+
+var inviteUserCmd = newInviteUserCmd()
+
+func newInviteUserCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "invite",
+		Aliases: []string{"renew-password"},
+		Short:   "Issue or renew a local password invitation",
+		Long: "Issue a one-time local password invitation for an existing user. " +
+			"The HTTPS link is displayed once and must be delivered privately. " +
+			"Enrollment is not available until the T2d page is implemented; do not send or deploy this link yet.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			opts, err := invitationOptions(cmd)
+			if err != nil {
+				return err
+			}
+			return grpcRunE(func(ctx context.Context, client v1.HeadscaleServiceClient, cmd *cobra.Command, _ []string) error {
+				return issueLocalInvitation(ctx, client, cmd, opts)
+			})(cmd, args)
+		},
+	}
+	cmd.Flags().Uint64P("identifier", "i", 0, "Existing local user ID")
+	cmd.Flags().String("lifetime", "24h", "Invitation lifetime in whole seconds (default 24h, maximum 168h)")
+	cmd.Flags().String("origin", "", "HTTPS public origin (defaults to configured server_url)")
+	return cmd
+}
+
+func invitationOptions(cmd *cobra.Command) (localInvitationOptions, error) {
+	id, _ := cmd.Flags().GetUint64("identifier")
+	if id == 0 {
+		return localInvitationOptions{}, errors.New("--identifier must be a positive user ID")
+	}
+	durationText, _ := cmd.Flags().GetString("lifetime")
+	lifetime, err := time.ParseDuration(durationText)
+	if err != nil || lifetime < time.Second || lifetime > 7*24*time.Hour || lifetime%time.Second != 0 {
+		return localInvitationOptions{}, errors.New("--lifetime must be between 1s and 168h, in whole seconds")
+	}
+	origin, _ := cmd.Flags().GetString("origin")
+	if origin == "" {
+		origin = viper.GetString("server_url")
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil ||
+		u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" ||
+		u.RawFragment != "" || u.RawPath != "" || (u.Path != "" && u.Path != "/") {
+		return localInvitationOptions{}, errors.New("--origin or server_url must be an HTTPS origin without path, query, fragment or credentials")
+	}
+	return localInvitationOptions{userID: id, lifetimeSeconds: uint64(lifetime / time.Second), origin: u.Scheme + "://" + u.Host}, nil
+}
+
+func issueLocalInvitation(ctx context.Context, client v1.HeadscaleServiceClient, cmd *cobra.Command, opts localInvitationOptions) error {
+	response, err := client.IssueLocalInvitation(ctx, &v1.IssueLocalInvitationRequest{
+		UserId: opts.userID, LifetimeSeconds: opts.lifetimeSeconds,
+	})
+	if err != nil {
+		return fmt.Errorf("issuing local invitation: %w", err)
+	}
+	token := response.GetToken()
+	secret, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil || len(secret) != 32 {
+		return errors.New("server returned an invalid invitation token")
+	}
+	link := opts.origin + "/local-auth/enroll#" + token
+	outputFormat, _ := cmd.Flags().GetString("output")
+	output, err := formatOutput(map[string]string{"url": link}, link, outputFormat)
+	if err != nil {
+		return err
+	}
+	cmd.Println(output)
+	return nil
 }
 
 var createUserCmd = &cobra.Command{
