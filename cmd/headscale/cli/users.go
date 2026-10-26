@@ -5,8 +5,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
@@ -100,7 +102,7 @@ func newInviteUserCmd() *cobra.Command {
 	}
 	cmd.Flags().Uint64P("identifier", "i", 0, "Existing local user ID")
 	cmd.Flags().String("lifetime", "24h", "Invitation lifetime in whole seconds (default 24h, maximum 168h)")
-	cmd.Flags().String("origin", "", "HTTPS public origin (defaults to configured server_url)")
+	cmd.Flags().String("origin", "", "Public HTTPS DNS origin (defaults to configured server_url)")
 	return cmd
 }
 
@@ -119,12 +121,56 @@ func invitationOptions(cmd *cobra.Command) (localInvitationOptions, error) {
 		origin = viper.GetString("server_url")
 	}
 	u, err := url.Parse(origin)
-	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil ||
+	if err != nil || u.Scheme != "https" || !publicInvitationHost(u.Hostname()) || u.User != nil ||
 		u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" ||
 		u.RawFragment != "" || u.RawPath != "" || (u.Path != "" && u.Path != "/") {
-		return localInvitationOptions{}, errors.New("--origin or server_url must be an HTTPS origin without path, query, fragment or credentials")
+		return localInvitationOptions{}, errors.New("--origin or server_url must be a public HTTPS DNS origin without path, query, fragment or credentials")
 	}
 	return localInvitationOptions{userID: id, lifetimeSeconds: uint64(lifetime / time.Second), origin: u.Scheme + "://" + u.Host}, nil
+}
+
+// publicInvitationHost requires a public-style DNS name, rejecting all IP literals
+// and known local names. DNS reachability and TLS trust remain operator checks.
+func publicInvitationHost(host string) bool {
+	if _, err := netip.ParseAddr(host); err == nil {
+		return false
+	}
+	name := strings.TrimSuffix(strings.ToLower(host), ".")
+	if len(name) > 253 || !strings.Contains(name, ".") {
+		return false
+	}
+	labels := strings.Split(name, ".")
+	suffix := labels[len(labels)-1]
+	for _, reserved := range []string{"localhost", "local", "localdomain", "internal", "home", "lan", "test", "invalid", "example"} {
+		if name == reserved || strings.HasSuffix(name, "."+reserved) {
+			return false
+		}
+	}
+	if strings.HasSuffix(name, ".home.arpa") {
+		return false
+	}
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, ch := range label {
+			if !(ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || ch == '-') {
+				return false
+			}
+		}
+	}
+	if len(suffix) < 2 {
+		return false
+	}
+	if strings.HasPrefix(suffix, "xn--") {
+		return len(suffix) > 4
+	}
+	for _, ch := range suffix {
+		if ch < 'a' || ch > 'z' {
+			return false
+		}
+	}
+	return true
 }
 
 func issueLocalInvitation(ctx context.Context, client v1.HeadscaleServiceClient, cmd *cobra.Command, opts localInvitationOptions) error {
