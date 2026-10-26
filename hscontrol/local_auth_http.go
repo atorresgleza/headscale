@@ -165,9 +165,21 @@ const (
 )
 
 type localApproval struct {
-	AuthID types.AuthID
-	UserID types.UserID
+	AuthID  types.AuthID
+	UserID  types.UserID
+	Request *types.AuthRequest
+	CSRF    string
 }
+
+var localDeviceReviewPage = template.Must(template.New("local-review").Parse(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Review device</title></head><body>
+<h1>Review device registration</h1>
+<p>Device name: {{.Hostname}}</p>
+<p>Machine key: {{.MachineKey}}</p><p>Node key: {{.NodeKey}}</p>
+<p>Requested tags: {{.Tags}}</p>
+<form method="post" action="/register/confirm/{{.AuthID}}">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<button type="submit">Approve this device</button></form></body></html>`))
 
 var localLoginPage = template.Must(template.New("local-login").Parse(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Device sign-in</title></head><body>
@@ -292,7 +304,26 @@ func (h *Headscale) localAuthDeviceLoginPOST(w http.ResponseWriter, r *http.Requ
 		fail(http.StatusServiceUnavailable)
 		return
 	}
-	h.localApprovals.Add(session, localApproval{AuthID: authID, UserID: userID})
+	confirmCSRF, err := localEnrollRandom()
+	if err != nil {
+		fail(http.StatusServiceUnavailable)
+		return
+	}
+	data := entry.RegistrationData()
+	tags := "None"
+	if data.Hostinfo != nil && len(data.Hostinfo.RequestTags) != 0 {
+		tags = strings.Join(data.Hostinfo.RequestTags, ", ")
+	}
+	var page bytes.Buffer
+	if err := localDeviceReviewPage.Execute(&page, struct {
+		AuthID, Hostname, MachineKey, NodeKey, Tags, CSRF string
+	}{authID.String(), data.Hostname, data.MachineKey.String(), data.NodeKey.String(), tags, confirmCSRF}); err != nil {
+		fail(http.StatusServiceUnavailable)
+		return
+	}
+	h.localApprovals.Add(session, localApproval{
+		AuthID: authID, UserID: userID, Request: entry, CSRF: confirmCSRF,
+	})
 	http.SetCookie(w, &http.Cookie{
 		Name: localLoginCSRFCookie, Value: "", Path: "/", MaxAge: -1,
 		Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
@@ -301,6 +332,7 @@ func (h *Headscale) localAuthDeviceLoginPOST(w http.ResponseWriter, r *http.Requ
 		Name: localApprovalCookie, Value: session, Path: "/", MaxAge: 600,
 		Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
 	})
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte("Sign-in verified. Device approval is not available in this build.\n"))
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(page.Bytes()) // The template escapes all client-supplied identity fields.
 }

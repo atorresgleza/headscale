@@ -12,6 +12,8 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 )
 
 func localAuthHTTPTestApp(t *testing.T, enabled bool) *Headscale {
@@ -544,4 +546,50 @@ func TestLocalAuthDeviceLoginRejectsEvictedAndNonRegistrationAuthID(t *testing.T
 		csrf, "https://login.example.org")
 	require.Equal(t, http.StatusNotFound, post.Code)
 	require.Empty(t, post.Result().Cookies())
+}
+
+func TestLocalAuthDeviceReviewRendersEscapedIdentityWithoutApproval(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user := app.GetState().CreateUserForTest("alice")
+	invitation, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	_, err = app.GetState().RedeemLocalInvitation(invitation, "correct horse battery staple")
+	require.NoError(t, err)
+	authID := types.MustAuthID()
+	machineKey, nodeKey := key.NewMachine().Public(), key.NewNode().Public()
+	app.GetState().SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: machineKey, NodeKey: nodeKey, Hostname: "laptop<script>alert(1)</script>",
+		Hostinfo: &tailcfg.Hostinfo{RequestTags: []string{"tag:dev<script>"}},
+	}))
+	page := localAuthRegisterGET(app, authID, "10.0.0.5:1234")
+	require.Equal(t, http.StatusOK, page.Code)
+	require.Len(t, page.Result().Cookies(), 1)
+	loginCSRF := page.Result().Cookies()[0]
+	review := localAuthLoginPOST(app, authID, url.Values{
+		"name": {"alice"}, "password": {"correct horse battery staple"}, "csrf": {loginCSRF.Value},
+	}, loginCSRF, "https://login.example.org")
+	require.Equal(t, http.StatusOK, review.Code)
+	require.Contains(t, review.Header().Get("Content-Type"), "text/html")
+	require.Contains(t, review.Header().Get("Content-Security-Policy"), "form-action 'self'")
+	require.Contains(t, review.Body.String(), machineKey.String())
+	require.Contains(t, review.Body.String(), nodeKey.String())
+	require.Contains(t, review.Body.String(), "laptop&lt;script&gt;alert(1)&lt;/script&gt;")
+	require.Contains(t, review.Body.String(), "tag:dev&lt;script&gt;")
+	require.NotContains(t, review.Body.String(), "<script>")
+	require.Contains(t, review.Body.String(), `/register/confirm/`+authID.String())
+	confirm := regexp.MustCompile(`name="csrf" value="([A-Za-z0-9_-]{43})"`).FindStringSubmatch(review.Body.String())
+	require.Len(t, confirm, 2)
+	require.NotEqual(t, loginCSRF.Value, confirm[1])
+	require.Empty(t, app.GetState().GetNodesByMachineKeyAllUsers(machineKey))
+	req := httptest.NewRequest(http.MethodPost, "http://login.example.org/register/confirm/"+authID.String(),
+		strings.NewReader(url.Values{"csrf": {confirm[1]}}.Encode()))
+	req.RemoteAddr = "10.0.0.5:1234"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("Origin", "https://login.example.org")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(review.Result().Cookies()[1])
+	missing := httptest.NewRecorder()
+	app.HTTPHandler().ServeHTTP(missing, req)
+	require.Equal(t, http.StatusNotFound, missing.Code)
+	require.Empty(t, app.GetState().GetNodesByMachineKeyAllUsers(machineKey))
 }
