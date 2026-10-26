@@ -18,6 +18,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"golang.org/x/net/publicsuffix"
 )
 
 // CLI user errors.
@@ -129,27 +130,17 @@ func invitationOptions(cmd *cobra.Command) (localInvitationOptions, error) {
 	return localInvitationOptions{userID: id, lifetimeSeconds: uint64(lifetime / time.Second), origin: u.Scheme + "://" + u.Host}, nil
 }
 
-// publicInvitationHost requires a public-style DNS name, rejecting all IP literals
-// and known local names. DNS reachability and TLS trust remain operator checks.
+// publicInvitationHost requires an ICANN-registrable DNS name, rejecting IP
+// literals, private suffixes, and special-use .onion/.arpa. DNS/TLS remain operator checks.
 func publicInvitationHost(host string) bool {
 	if _, err := netip.ParseAddr(host); err == nil {
 		return false
 	}
 	name := strings.TrimSuffix(strings.ToLower(host), ".")
-	if len(name) > 253 || !strings.Contains(name, ".") {
+	if len(name) > 253 || !strings.Contains(name, ".") || strings.HasSuffix(name, ".onion") || strings.HasSuffix(name, ".arpa") {
 		return false
 	}
-	labels := strings.Split(name, ".")
-	suffix := labels[len(labels)-1]
-	for _, reserved := range []string{"localhost", "local", "localdomain", "internal", "home", "lan", "test", "invalid", "example"} {
-		if name == reserved || strings.HasSuffix(name, "."+reserved) {
-			return false
-		}
-	}
-	if strings.HasSuffix(name, ".home.arpa") {
-		return false
-	}
-	for _, label := range labels {
+	for _, label := range strings.Split(name, ".") {
 		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
 			return false
 		}
@@ -159,18 +150,12 @@ func publicInvitationHost(host string) bool {
 			}
 		}
 	}
-	if len(suffix) < 2 {
+	_, icann := publicsuffix.PublicSuffix(name)
+	if !icann {
 		return false
 	}
-	if strings.HasPrefix(suffix, "xn--") {
-		return len(suffix) > 4
-	}
-	for _, ch := range suffix {
-		if ch < 'a' || ch > 'z' {
-			return false
-		}
-	}
-	return true
+	_, err := publicsuffix.EffectiveTLDPlusOne(name)
+	return err == nil
 }
 
 func issueLocalInvitation(ctx context.Context, client v1.HeadscaleServiceClient, cmd *cobra.Command, opts localInvitationOptions) error {
