@@ -2,6 +2,7 @@ package state
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -1613,4 +1614,104 @@ func TestTaggingPreservesNodeExpiry(t *testing.T) {
 	require.True(t, tagged.IsTagged())
 	require.NotNil(t, tagged.AsStruct().Expiry, "tag change must not clear expiry")
 	require.Equal(t, expiry.Unix(), tagged.AsStruct().Expiry.Unix())
+}
+
+// A pending AuthID must be consumed once even when browser, CLI, or OIDC
+// callbacks race on the same machine. The original client keys are immutable.
+func TestAuthPathConcurrentOneShotKeepsClientKeys(t *testing.T) {
+	s, err := NewState(persistTestConfig(t.TempDir() + "/headscale.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+	user := s.CreateUserForTest("alice")
+	machineKey := key.NewMachine().Public()
+	nodeKey := key.NewNode().Public()
+	authID := types.MustAuthID()
+	s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: machineKey, NodeKey: nodeKey, Hostname: "laptop",
+	}))
+	const callers = 16
+	start := make(chan struct{})
+	results := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			node, _, err := s.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, util.RegisterMethodCLI)
+			if err == nil {
+				if node.AsStruct().MachineKey != machineKey || node.AsStruct().NodeKey != nodeKey || node.User().ID() != user.ID {
+					results <- fmt.Errorf("registered wrong node identity")
+					return
+				}
+			}
+			results <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	successes := 0
+	for err := range results {
+		if err == nil {
+			successes++
+			continue
+		}
+		require.ErrorIs(t, err, db.ErrNodeNotFoundRegistrationCache)
+	}
+	require.Equal(t, 1, successes)
+	_, _, err = s.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, util.RegisterMethodCLI)
+	require.ErrorIs(t, err, db.ErrNodeNotFoundRegistrationCache)
+}
+
+func TestAuthPathRejectsNonRegistrationAndRetainsFailedRequest(t *testing.T) {
+	s, err := NewState(persistTestConfig(t.TempDir() + "/headscale.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+	user := s.CreateUserForTest("alice")
+	sshID := types.MustAuthID()
+	s.SetAuthCacheEntry(sshID, types.NewSSHCheckAuthRequest(types.NodeID(1), types.NodeID(2)))
+	_, _, err = s.HandleNodeFromAuthPath(sshID, types.UserID(user.ID), nil, util.RegisterMethodCLI)
+	require.ErrorIs(t, err, db.ErrNodeNotFoundRegistrationCache)
+	authID := types.MustAuthID()
+	machineKey := key.NewMachine().Public()
+	nodeKey := key.NewNode().Public()
+	s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: machineKey, NodeKey: nodeKey, Hostname: "laptop",
+	}))
+	_, _, err = s.HandleNodeFromAuthPath(authID, 999999, nil, util.RegisterMethodCLI)
+	require.Error(t, err)
+	node, _, err := s.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, util.RegisterMethodCLI)
+	require.NoError(t, err) // failed authorization left the original request usable
+	require.Equal(t, machineKey, node.AsStruct().MachineKey)
+	require.Equal(t, nodeKey, node.AsStruct().NodeKey)
+}
+
+func TestAuthPathLocalMethodDoesNotTransferExistingUserNode(t *testing.T) {
+	s, err := NewState(persistTestConfig(t.TempDir() + "/headscale.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+	alice, bob := s.CreateUserForTest("alice"), s.CreateUserForTest("bob")
+	machineKey := key.NewMachine().Public()
+	firstKey, secondKey := key.NewNode().Public(), key.NewNode().Public()
+	register := func(user *types.User, nodeKey key.NodePublic) types.NodeView {
+		authID := types.MustAuthID()
+		s.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+			MachineKey: machineKey, NodeKey: nodeKey, Hostname: "laptop",
+		}))
+		node, _, err := s.HandleNodeFromAuthPath(authID, types.UserID(user.ID), nil, util.RegisterMethodLocal)
+		require.NoError(t, err)
+		require.Equal(t, machineKey, node.AsStruct().MachineKey)
+		require.Equal(t, nodeKey, node.AsStruct().NodeKey)
+		require.Equal(t, util.RegisterMethodLocal, node.AsStruct().RegisterMethod)
+		return node
+	}
+	first := register(alice, firstKey)
+	second := register(bob, secondKey)
+	require.NotEqual(t, first.ID(), second.ID())
+	nodes := s.GetNodesByMachineKeyAllUsers(machineKey)
+	require.Equal(t, first.ID(), nodes[types.UserID(alice.ID)].ID())
+	require.Equal(t, firstKey, nodes[types.UserID(alice.ID)].NodeKey())
+	require.Equal(t, second.ID(), nodes[types.UserID(bob.ID)].ID())
+	require.Equal(t, secondKey, nodes[types.UserID(bob.ID)].NodeKey())
 }

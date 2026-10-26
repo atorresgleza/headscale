@@ -2144,7 +2144,7 @@ func (s *State) HandleNodeFromAuthPath(
 ) (types.NodeView, change.Change, error) {
 	// Get the registration entry from cache
 	regEntry, ok := s.GetAuthCacheEntry(authID)
-	if !ok {
+	if !ok || !regEntry.IsRegistration() {
 		return types.NodeView{}, change.Change{}, hsdb.ErrNodeNotFoundRegistrationCache
 	}
 
@@ -2174,6 +2174,14 @@ func (s *State) HandleNodeFromAuthPath(
 	// Serialise registration for this machine so concurrent auth callbacks
 	// resolve to a single node rather than racing the find-then-create section.
 	defer s.lockRegistration(machineKey)()
+
+	// The first lookup only located the machine lock. Another CLI, OIDC or
+	// local callback may have consumed or replaced this AuthID while we waited;
+	// never apply its stale registration data a second time.
+	current, stillPending := s.GetAuthCacheEntry(authID)
+	if !stillPending || current != regEntry {
+		return types.NodeView{}, change.Change{}, hsdb.ErrNodeNotFoundRegistrationCache
+	}
 
 	all := s.nodeStore.GetNodesByMachineKeyAllUsers(machineKey)
 
