@@ -112,7 +112,9 @@ type Headscale struct {
 
 	// Short-lived browser logins bind a verified user to an existing pending
 	// AuthID; a separate explicit confirmation is required to register a node.
-	localApprovals *expirable.LRU[string, localApproval]
+	localApprovals   *expirable.LRU[string, localApproval]
+	localApprovalMu  sync.Mutex // serializes one-shot confirmation claims
+	localApprovalNow func() time.Time
 
 	clientStreamsOpen sync.WaitGroup
 }
@@ -156,6 +158,7 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 
 	if cfg.LocalAuth.Enabled {
 		app.localApprovals = expirable.NewLRU[string, localApproval](1024, nil, 10*time.Minute)
+		app.localApprovalNow = time.Now
 	}
 
 	if len(cfg.TrustedProxies) > 0 {
@@ -635,6 +638,7 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 	if h.cfg.LocalAuth.Enabled {
 		r.Get("/register/{auth_id}", h.localAuthDeviceLoginPage)
 		r.Post("/register/login/{auth_id}", h.localAuthDeviceLoginPOST)
+		r.Post("/register/confirm/{auth_id}", h.localAuthDeviceConfirmPOST)
 	} else {
 		r.Get("/register/{auth_id}", h.authProvider.RegisterHandler)
 	}

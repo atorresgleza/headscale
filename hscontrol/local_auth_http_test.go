@@ -7,10 +7,14 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/golang-lru/v2/expirable"
+	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -28,10 +32,14 @@ func localAuthHTTPTestApp(t *testing.T, enabled bool) *Headscale {
 			Sqlite: types.SqliteConfig{Path: t.TempDir() + "/headscale.db"},
 		},
 		Policy: types.PolicyConfig{Mode: types.PolicyModeDB},
+		Tuning: types.Tuning{BatchChangeDelay: 100 * time.Millisecond, BatcherWorkers: 1},
 	}
 	app, err := NewHeadscale(cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, app.GetState().Close()) })
+	app.mapBatcher = mapper.NewBatcherAndMapper(cfg, app.state)
+	app.mapBatcher.Start()
+	t.Cleanup(func() { app.mapBatcher.Close() })
 	return app
 }
 
@@ -590,6 +598,289 @@ func TestLocalAuthDeviceReviewRendersEscapedIdentityWithoutApproval(t *testing.T
 	req.AddCookie(review.Result().Cookies()[1])
 	missing := httptest.NewRecorder()
 	app.HTTPHandler().ServeHTTP(missing, req)
-	require.Equal(t, http.StatusNotFound, missing.Code)
+	require.Equal(t, http.StatusForbidden, missing.Code)
 	require.Empty(t, app.GetState().GetNodesByMachineKeyAllUsers(machineKey))
+}
+
+func localAuthReview(t *testing.T, app *Headscale, authID types.AuthID) (string, *http.Cookie) {
+	t.Helper()
+	page := localAuthRegisterGET(app, authID, "10.0.0.5:1234")
+	require.Equal(t, http.StatusOK, page.Code)
+	require.Len(t, page.Result().Cookies(), 1)
+	loginCSRF := page.Result().Cookies()[0]
+	review := localAuthLoginPOST(app, authID, url.Values{
+		"name": {"alice"}, "password": {"correct horse battery staple"}, "csrf": {loginCSRF.Value},
+	}, loginCSRF, "https://login.example.org")
+	require.Equal(t, http.StatusOK, review.Code)
+	require.Len(t, review.Result().Cookies(), 2)
+	match := regexp.MustCompile(`name="csrf" value="([A-Za-z0-9_-]{43})"`).FindStringSubmatch(review.Body.String())
+	require.Len(t, match, 2)
+	return match[1], review.Result().Cookies()[1]
+}
+
+func localAuthConfirmPOST(app *Headscale, authID types.AuthID, csrf string, cookie *http.Cookie, origin string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "http://login.example.org/register/confirm/"+authID.String(),
+		strings.NewReader(url.Values{"csrf": {csrf}}.Encode()))
+	req.RemoteAddr = "10.0.0.5:1234"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	app.HTTPHandler().ServeHTTP(rec, req)
+	return rec
+}
+
+func TestLocalAuthDeviceConfirmApprovesOnlyAfterExplicitPOST(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user, _, err := app.GetState().CreateUser(types.User{Name: "alice", Email: "alice@example.org"})
+	require.NoError(t, err)
+	invitation, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	_, err = app.GetState().RedeemLocalInvitation(invitation, "correct horse battery staple")
+	require.NoError(t, err)
+	authID := types.MustAuthID()
+	machineKey, nodeKey := key.NewMachine().Public(), key.NewNode().Public()
+	app.GetState().SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: machineKey, NodeKey: nodeKey, Hostname: "laptop",
+	}))
+	csrf, cookie := localAuthReview(t, app, authID)
+	require.Empty(t, app.GetState().GetNodesByMachineKeyAllUsers(machineKey))
+	approved := localAuthConfirmPOST(app, authID, csrf, cookie, "https://login.example.org")
+	require.Equal(t, http.StatusOK, approved.Code)
+	require.Equal(t, "no-store", approved.Header().Get("Cache-Control"))
+	require.NotContains(t, approved.Body.String(), csrf)
+	require.Equal(t, "Device approved.\n", approved.Body.String())
+	require.Len(t, approved.Result().Cookies(), 1)
+	require.Equal(t, -1, approved.Result().Cookies()[0].MaxAge)
+	nodes := app.GetState().GetNodesByMachineKeyAllUsers(machineKey)
+	require.Len(t, nodes, 1)
+	node := nodes[types.UserID(user.ID)]
+	require.Equal(t, machineKey, node.AsStruct().MachineKey)
+	require.Equal(t, nodeKey, node.AsStruct().NodeKey)
+	require.Equal(t, util.RegisterMethodLocal, node.AsStruct().RegisterMethod)
+	stored, err := app.GetState().GetUserByID(types.UserID(user.ID))
+	require.NoError(t, err)
+	require.Equal(t, user.Email, stored.Email)
+	replay := localAuthConfirmPOST(app, authID, csrf, cookie, "https://login.example.org")
+	require.Equal(t, http.StatusForbidden, replay.Code)
+	require.Equal(t, "Unable to approve device.\n", replay.Body.String())
+	require.Len(t, app.GetState().GetNodesByMachineKeyAllUsers(machineKey), 1)
+	require.Equal(t, http.StatusNotFound, localAuthRegisterGET(app, authID, "10.0.0.5:1234").Code)
+}
+
+func TestLocalAuthDeviceConfirmRejectsCrossDeviceAndCSRF(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user := app.GetState().CreateUserForTest("alice")
+	invitation, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	_, err = app.GetState().RedeemLocalInvitation(invitation, "correct horse battery staple")
+	require.NoError(t, err)
+	first := localAuthPendingDevice(app)
+	second := localAuthPendingDevice(app)
+	csrf, cookie := localAuthReview(t, app, first)
+	for _, tc := range []struct {
+		name         string
+		id           types.AuthID
+		csrf, origin string
+		cookie       *http.Cookie
+	}{
+		{"wrong device", second, csrf, "https://login.example.org", cookie},
+		{"wrong origin", first, csrf, "https://other.example.org", cookie},
+		{"wrong csrf", first, "wrong", "https://login.example.org", cookie},
+		{"missing cookie", first, csrf, "https://login.example.org", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rejected := localAuthConfirmPOST(app, tc.id, tc.csrf, tc.cookie, tc.origin)
+			require.Equal(t, http.StatusForbidden, rejected.Code)
+			require.Equal(t, "Unable to approve device.\n", rejected.Body.String())
+			require.Empty(t, rejected.Result().Cookies())
+		})
+	}
+	accepted := localAuthConfirmPOST(app, first, csrf, cookie, "https://login.example.org")
+	require.Equal(t, http.StatusOK, accepted.Code) // rejected requests never consumed the session
+}
+
+func TestLocalAuthDeviceConfirmRejectsExpiredAndEvictedSessions(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user := app.GetState().CreateUserForTest("alice")
+	invitation, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	_, err = app.GetState().RedeemLocalInvitation(invitation, "correct horse battery staple")
+	require.NoError(t, err)
+	// Bound the isolated fixture to two sessions; assertions use only HTTP
+	// responses and registered nodes, never the cache's internal contents.
+	app.localApprovals = expirable.NewLRU[string, localApproval](2, nil, 10*time.Minute)
+	pending := []types.AuthID{localAuthPendingDevice(app), localAuthPendingDevice(app), localAuthPendingDevice(app)}
+	csrf := make([]string, 3)
+	cookies := make([]*http.Cookie, 3)
+	for i, id := range pending {
+		csrf[i], cookies[i] = localAuthReview(t, app, id)
+	}
+	evicted := localAuthConfirmPOST(app, pending[0], csrf[0], cookies[0], "https://login.example.org")
+	require.Equal(t, http.StatusForbidden, evicted.Code)
+	require.Equal(t, "Unable to approve device.\n", evicted.Body.String())
+	valid := localAuthConfirmPOST(app, pending[2], csrf[2], cookies[2], "https://login.example.org")
+	require.Equal(t, http.StatusOK, valid.Code)
+
+	other := localAuthHTTPTestApp(t, true)
+	second := other.GetState().CreateUserForTest("alice")
+	invitation, err = other.GetState().IssueLocalInvitation(types.UserID(second.ID), time.Hour)
+	require.NoError(t, err)
+	_, err = other.GetState().RedeemLocalInvitation(invitation, "correct horse battery staple")
+	require.NoError(t, err)
+	clock := time.Now()
+	other.localApprovalNow = func() time.Time { return clock }
+	id := localAuthPendingDevice(other)
+	token, cookie := localAuthReview(t, other, id)
+	clock = clock.Add(11 * time.Minute)
+	expired := localAuthConfirmPOST(other, id, token, cookie, "https://login.example.org")
+	require.Equal(t, http.StatusForbidden, expired.Code)
+	require.Equal(t, "Unable to approve device.\n", expired.Body.String())
+	require.Empty(t, expired.Result().Cookies())
+}
+
+func TestLocalAuthDeviceConfirmRejectsReplacedPendingRequest(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user := app.GetState().CreateUserForTest("alice")
+	invitation, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	_, err = app.GetState().RedeemLocalInvitation(invitation, "correct horse battery staple")
+	require.NoError(t, err)
+	authID := types.MustAuthID()
+	firstKey, secondKey := key.NewMachine().Public(), key.NewMachine().Public()
+	app.GetState().SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: firstKey, NodeKey: key.NewNode().Public(), Hostname: "first",
+	}))
+	csrf, cookie := localAuthReview(t, app, authID)
+	app.GetState().SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: secondKey, NodeKey: key.NewNode().Public(), Hostname: "second",
+	}))
+	rejected := localAuthConfirmPOST(app, authID, csrf, cookie, "https://login.example.org")
+	require.Equal(t, http.StatusForbidden, rejected.Code)
+	require.Empty(t, app.GetState().GetNodesByMachineKeyAllUsers(firstKey))
+	require.Empty(t, app.GetState().GetNodesByMachineKeyAllUsers(secondKey))
+	newCSRF, newCookie := localAuthReview(t, app, authID)
+	accepted := localAuthConfirmPOST(app, authID, newCSRF, newCookie, "https://login.example.org")
+	require.Equal(t, http.StatusOK, accepted.Code)
+	require.Len(t, app.GetState().GetNodesByMachineKeyAllUsers(secondKey), 1)
+}
+
+func TestLocalAuthDeviceConfirmConcurrentOneShot(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user := app.GetState().CreateUserForTest("alice")
+	invitation, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	_, err = app.GetState().RedeemLocalInvitation(invitation, "correct horse battery staple")
+	require.NoError(t, err)
+	authID := types.MustAuthID()
+	machineKey, nodeKey := key.NewMachine().Public(), key.NewNode().Public()
+	app.GetState().SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: machineKey, NodeKey: nodeKey, Hostname: "laptop",
+	}))
+	csrf, cookie := localAuthReview(t, app, authID)
+	const callers = 12
+	start := make(chan struct{})
+	outcomes := make(chan int, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			outcomes <- localAuthConfirmPOST(app, authID, csrf, cookie, "https://login.example.org").Code
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(outcomes)
+	approved := 0
+	for code := range outcomes {
+		if code == http.StatusOK {
+			approved++
+			continue
+		}
+		require.Equal(t, http.StatusForbidden, code)
+	}
+	require.Equal(t, 1, approved)
+	nodes := app.GetState().GetNodesByMachineKeyAllUsers(machineKey)
+	require.Len(t, nodes, 1)
+	require.Equal(t, nodeKey, nodes[types.UserID(user.ID)].AsStruct().NodeKey)
+}
+
+func TestLocalAuthDeviceConfirmRejectsMalformedAndUnavailable(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user := app.GetState().CreateUserForTest("alice")
+	invitation, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	_, err = app.GetState().RedeemLocalInvitation(invitation, "correct horse battery staple")
+	require.NoError(t, err)
+	authID := localAuthPendingDevice(app)
+	csrf, cookie := localAuthReview(t, app, authID)
+	fields := url.Values{"csrf": {csrf}}
+	post := func(rawURL, remote, body string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, rawURL, strings.NewReader(body))
+		req.RemoteAddr = remote
+		req.Header.Set("X-Forwarded-Proto", "https")
+		req.Header.Set("Origin", "https://login.example.org")
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		rec := httptest.NewRecorder()
+		app.HTTPHandler().ServeHTTP(rec, req)
+		return rec
+	}
+	path := "http://login.example.org/register/confirm/" + authID.String()
+	duplicate := post(path, "10.0.0.5:1234", fields.Encode(), cookie, &http.Cookie{Name: cookie.Name, Value: "poison"})
+	require.Equal(t, http.StatusForbidden, duplicate.Code)
+	require.Empty(t, duplicate.Result().Cookies())
+	untrusted := post(path, "203.0.113.8:1234", fields.Encode(), cookie)
+	require.Equal(t, http.StatusForbidden, untrusted.Code)
+	tooLarge := post(path, "10.0.0.5:1234", url.Values{"csrf": {csrf}, "padding": {strings.Repeat("a", 9000)}}.Encode(), cookie)
+	require.Equal(t, http.StatusBadRequest, tooLarge.Code)
+	query := post(path+"?csrf="+csrf, "10.0.0.5:1234", fields.Encode(), cookie)
+	require.Equal(t, http.StatusBadRequest, query.Code)
+	require.Equal(t, http.StatusOK, localAuthConfirmPOST(app, authID, csrf, cookie, "https://login.example.org").Code)
+
+	other := localAuthHTTPTestApp(t, true)
+	u := other.GetState().CreateUserForTest("alice")
+	token, err := other.GetState().IssueLocalInvitation(types.UserID(u.ID), time.Hour)
+	require.NoError(t, err)
+	_, err = other.GetState().RedeemLocalInvitation(token, "correct horse battery staple")
+	require.NoError(t, err)
+	second := localAuthPendingDevice(other)
+	secondCSRF, secondCookie := localAuthReview(t, other, second)
+	require.NoError(t, other.GetState().Close())
+	unavailable := localAuthConfirmPOST(other, second, secondCSRF, secondCookie, "https://login.example.org")
+	require.Equal(t, http.StatusServiceUnavailable, unavailable.Code)
+	require.Equal(t, "Unable to approve device.\n", unavailable.Body.String())
+	require.Len(t, unavailable.Result().Cookies(), 1) // consumed before storage failure
+	require.Equal(t, -1, unavailable.Result().Cookies()[0].MaxAge)
+}
+
+func TestLocalAuthDeviceConfirmRejectsUnownedRequestedTag(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user := app.GetState().CreateUserForTest("alice")
+	invitation, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	_, err = app.GetState().RedeemLocalInvitation(invitation, "correct horse battery staple")
+	require.NoError(t, err)
+	authID := types.MustAuthID()
+	machineKey := key.NewMachine().Public()
+	app.GetState().SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: machineKey, NodeKey: key.NewNode().Public(), Hostname: "laptop",
+		Hostinfo: &tailcfg.Hostinfo{RequestTags: []string{"tag:unowned"}},
+	}))
+	csrf, cookie := localAuthReview(t, app, authID)
+	refused := localAuthConfirmPOST(app, authID, csrf, cookie, "https://login.example.org")
+	require.Equal(t, http.StatusForbidden, refused.Code)
+	require.Equal(t, "Unable to approve device.\n", refused.Body.String())
+	require.Len(t, refused.Result().Cookies(), 1)
+	require.Equal(t, -1, refused.Result().Cookies()[0].MaxAge)
+	require.Empty(t, app.GetState().GetNodesByMachineKeyAllUsers(machineKey))
+	require.Equal(t, http.StatusForbidden,
+		localAuthConfirmPOST(app, authID, csrf, cookie, "https://login.example.org").Code)
 }

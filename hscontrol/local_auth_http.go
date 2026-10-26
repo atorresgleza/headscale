@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"html/template"
 	"mime"
@@ -13,7 +14,9 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 )
 
 const localEnrollCSRFCookie = "__Host-hs-local-enroll-csrf"
@@ -165,10 +168,11 @@ const (
 )
 
 type localApproval struct {
-	AuthID  types.AuthID
-	UserID  types.UserID
-	Request *types.AuthRequest
-	CSRF    string
+	AuthID    types.AuthID
+	UserID    types.UserID
+	Request   *types.AuthRequest
+	CSRF      string
+	ExpiresAt time.Time
 }
 
 var localDeviceReviewPage = template.Must(template.New("local-review").Parse(`<!doctype html>
@@ -323,6 +327,7 @@ func (h *Headscale) localAuthDeviceLoginPOST(w http.ResponseWriter, r *http.Requ
 	}
 	h.localApprovals.Add(session, localApproval{
 		AuthID: authID, UserID: userID, Request: entry, CSRF: confirmCSRF,
+		ExpiresAt: h.localApprovalNow().Add(10 * time.Minute),
 	})
 	http.SetCookie(w, &http.Cookie{
 		Name: localLoginCSRFCookie, Value: "", Path: "/", MaxAge: -1,
@@ -335,4 +340,86 @@ func (h *Headscale) localAuthDeviceLoginPOST(w http.ResponseWriter, r *http.Requ
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write(page.Bytes()) // The template escapes all client-supplied identity fields.
+}
+
+// localAuthDeviceConfirmPOST is the sole browser path that may finalize an
+// existing Noise-bound pending registration. Rejections never claim state;
+// a valid confirmation claims its opaque session exactly once before mutation.
+func (h *Headscale) localAuthDeviceConfirmPOST(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	fail := func(code int) { http.Error(w, "Unable to approve device.", code) }
+	authID, err := authIDFromRequest(r)
+	if err != nil {
+		fail(http.StatusBadRequest)
+		return
+	}
+	if r.URL.RawQuery != "" || r.URL.ForceQuery {
+		fail(http.StatusBadRequest)
+		return
+	}
+	origin := r.Header.Values("Origin")
+	if len(origin) != 1 || origin[0] != strings.TrimSuffix(h.cfg.ServerURL, "/") {
+		fail(http.StatusForbidden)
+		return
+	}
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/x-www-form-urlencoded" {
+		fail(http.StatusBadRequest)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8*1024)
+	if err := r.ParseForm(); err != nil {
+		fail(http.StatusBadRequest)
+		return
+	}
+	csrf := r.PostForm["csrf"]
+	if len(r.PostForm) != 1 || len(csrf) != 1 {
+		fail(http.StatusBadRequest)
+		return
+	}
+	cookies := r.CookiesNamed(localApprovalCookie)
+	if len(csrf[0]) != 43 || len(cookies) != 1 || len(cookies[0].Value) != 43 {
+		fail(http.StatusForbidden)
+		return
+	}
+	h.localApprovalMu.Lock()
+	approval, ok := h.localApprovals.Get(cookies[0].Value)
+	if !ok || approval.AuthID != authID ||
+		!h.localApprovalNow().Before(approval.ExpiresAt) ||
+		subtle.ConstantTimeCompare([]byte(approval.CSRF), []byte(csrf[0])) != 1 {
+		h.localApprovalMu.Unlock()
+		fail(http.StatusForbidden)
+		return
+	}
+	entry, stillPending := h.state.GetAuthCacheEntry(authID)
+	if !stillPending || entry != approval.Request || !entry.IsRegistration() {
+		h.localApprovalMu.Unlock()
+		fail(http.StatusForbidden)
+		return
+	}
+	h.localApprovals.Remove(cookies[0].Value)
+	h.localApprovalMu.Unlock()
+	http.SetCookie(w, &http.Cookie{
+		Name: localApprovalCookie, Value: "", Path: "/", MaxAge: -1,
+		Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	})
+	node, nodeChange, err := h.state.HandleNodeFromAuthPathIfCurrent(
+		authID, approval.UserID, nil, util.RegisterMethodLocal, approval.Request,
+	)
+	if err != nil {
+		if errors.Is(err, state.ErrRequestedTagsInvalidOrNotPermitted) {
+			fail(http.StatusForbidden)
+		} else {
+			fail(http.StatusServiceUnavailable)
+		}
+		return
+	}
+	routesChange, err := h.state.AutoApproveRoutes(node)
+	if err != nil {
+		fail(http.StatusServiceUnavailable)
+		return
+	}
+	h.Change(nodeChange, routesChange)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte("Device approved.\n"))
 }
