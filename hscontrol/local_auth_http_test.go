@@ -884,3 +884,65 @@ func TestLocalAuthDeviceConfirmRejectsUnownedRequestedTag(t *testing.T) {
 	require.Equal(t, http.StatusForbidden,
 		localAuthConfirmPOST(app, authID, csrf, cookie, "https://login.example.org").Code)
 }
+
+// TestLocalAuthFullHTTPFlow exercises the public handlers with isolated
+// persistence and State; a browser and deployed proxy need separate proof.
+func TestLocalAuthFullHTTPFlow(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user, _, err := app.GetState().CreateUser(types.User{Name: "alice", Email: "alice@example.org"})
+	require.NoError(t, err)
+	invite, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	enrollCSRF, enrollCookie := enrollmentCSRF(t, app)
+	enroll := func(token, password string) *httptest.ResponseRecorder {
+		return enrollmentPOST(app, url.Values{
+			"token": {token}, "password": {password}, "csrf": {enrollCSRF},
+		}, enrollCookie, "https://login.example.org", "10.0.0.5:1234")
+	}
+	require.Equal(t, http.StatusNoContent, enroll(invite, "correct horse battery staple").Code)
+	replay := enroll(invite, "different horse battery staple")
+	require.Equal(t, http.StatusBadRequest, replay.Code)
+	require.Equal(t, "Unable to enroll.\n", replay.Body.String())
+
+	authID := types.MustAuthID()
+	machineKey, nodeKey := key.NewMachine().Public(), key.NewNode().Public()
+	app.GetState().SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: machineKey, NodeKey: nodeKey, Hostname: "laptop",
+	}))
+	csrf, cookie := localAuthReview(t, app, authID)
+	require.Empty(t, app.GetState().GetNodesByMachineKeyAllUsers(machineKey))
+	accepted := localAuthConfirmPOST(app, authID, csrf, cookie, "https://login.example.org")
+	require.Equal(t, http.StatusOK, accepted.Code)
+	require.Equal(t, "Device approved.\n", accepted.Body.String())
+	denied := localAuthConfirmPOST(app, authID, csrf, cookie, "https://login.example.org")
+	require.Equal(t, http.StatusForbidden, denied.Code)
+	require.Equal(t, "Unable to approve device.\n", denied.Body.String())
+	nodes := app.GetState().GetNodesByMachineKeyAllUsers(machineKey)
+	require.Len(t, nodes, 1)
+	require.Equal(t, nodeKey, nodes[types.UserID(user.ID)].AsStruct().NodeKey)
+	require.Equal(t, util.RegisterMethodLocal, nodes[types.UserID(user.ID)].AsStruct().RegisterMethod)
+	stored, err := app.GetState().GetUserByID(types.UserID(user.ID))
+	require.NoError(t, err)
+	require.Equal(t, user.Email, stored.Email)
+
+	renewed, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	enrollCSRF, enrollCookie = enrollmentCSRF(t, app)
+	require.Equal(t, http.StatusNoContent, enroll(renewed, "new correct horse battery staple").Code)
+	nextID := localAuthPendingDevice(app)
+	page := localAuthRegisterGET(app, nextID, "10.0.0.5:1234")
+	require.Equal(t, http.StatusOK, page.Code)
+	loginCookie := page.Result().Cookies()[0]
+	login := func(password string) *httptest.ResponseRecorder {
+		return localAuthLoginPOST(app, nextID, url.Values{
+			"name": {"alice"}, "password": {password}, "csrf": {loginCookie.Value},
+		}, loginCookie, "https://login.example.org")
+	}
+	old := login("correct horse battery staple")
+	require.Equal(t, http.StatusUnauthorized, old.Code)
+	require.Equal(t, "Unable to sign in.\n", old.Body.String())
+	require.Empty(t, old.Result().Cookies())
+	fresh := login("new correct horse battery staple")
+	require.Equal(t, http.StatusOK, fresh.Code)
+	require.NotContains(t, fresh.Body.String(), "new correct horse battery staple")
+}
