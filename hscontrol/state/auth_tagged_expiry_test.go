@@ -1715,3 +1715,27 @@ func TestAuthPathLocalMethodDoesNotTransferExistingUserNode(t *testing.T) {
 	require.Equal(t, second.ID(), nodes[types.UserID(bob.ID)].ID())
 	require.Equal(t, secondKey, nodes[types.UserID(bob.ID)].NodeKey())
 }
+
+func TestAuthPathExpectedRequestRejectsReplacement(t *testing.T) {
+	s, err := NewState(persistTestConfig(t.TempDir() + "/headscale.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+	user := s.CreateUserForTest("alice")
+	authID := types.MustAuthID()
+	oldMachine, newMachine := key.NewMachine().Public(), key.NewMachine().Public()
+	old := types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: oldMachine, NodeKey: key.NewNode().Public(), Hostname: "old",
+	})
+	s.SetAuthCacheEntry(authID, old)
+	replacement := types.NewRegisterAuthRequest(&types.RegistrationData{
+		MachineKey: newMachine, NodeKey: key.NewNode().Public(), Hostname: "new",
+	})
+	s.SetAuthCacheEntry(authID, replacement)
+	_, _, err = s.HandleNodeFromAuthPathIfCurrent(authID, types.UserID(user.ID), nil, util.RegisterMethodLocal, old)
+	require.ErrorIs(t, err, db.ErrNodeNotFoundRegistrationCache)
+	require.Empty(t, s.GetNodesByMachineKeyAllUsers(oldMachine))
+	require.Empty(t, s.GetNodesByMachineKeyAllUsers(newMachine))
+	node, _, err := s.HandleNodeFromAuthPathIfCurrent(authID, types.UserID(user.ID), nil, util.RegisterMethodLocal, replacement)
+	require.NoError(t, err)
+	require.Equal(t, newMachine, node.AsStruct().MachineKey)
+}

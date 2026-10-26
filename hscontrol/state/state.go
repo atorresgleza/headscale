@@ -2142,9 +2142,35 @@ func (s *State) HandleNodeFromAuthPath(
 	expiry *time.Time,
 	registrationMethod string,
 ) (types.NodeView, change.Change, error) {
+	return s.handleNodeFromAuthPath(authID, userID, expiry, registrationMethod, nil)
+}
+
+// HandleNodeFromAuthPathIfCurrent finalizes only the same pending request that
+// authenticated browser approval captured, never a replacement at that AuthID.
+// CLI and OIDC callers keep using HandleNodeFromAuthPath without this binding.
+func (s *State) HandleNodeFromAuthPathIfCurrent(
+	authID types.AuthID,
+	userID types.UserID,
+	expiry *time.Time,
+	registrationMethod string,
+	expected *types.AuthRequest,
+) (types.NodeView, change.Change, error) {
+	if expected == nil || !expected.IsRegistration() {
+		return types.NodeView{}, change.Change{}, hsdb.ErrNodeNotFoundRegistrationCache
+	}
+	return s.handleNodeFromAuthPath(authID, userID, expiry, registrationMethod, expected)
+}
+
+func (s *State) handleNodeFromAuthPath(
+	authID types.AuthID,
+	userID types.UserID,
+	expiry *time.Time,
+	registrationMethod string,
+	expected *types.AuthRequest,
+) (types.NodeView, change.Change, error) {
 	// Get the registration entry from cache
 	regEntry, ok := s.GetAuthCacheEntry(authID)
-	if !ok || !regEntry.IsRegistration() {
+	if !ok || !regEntry.IsRegistration() || (expected != nil && regEntry != expected) {
 		return types.NodeView{}, change.Change{}, hsdb.ErrNodeNotFoundRegistrationCache
 	}
 
@@ -2179,7 +2205,7 @@ func (s *State) HandleNodeFromAuthPath(
 	// local callback may have consumed or replaced this AuthID while we waited;
 	// never apply its stale registration data a second time.
 	current, stillPending := s.GetAuthCacheEntry(authID)
-	if !stillPending || current != regEntry {
+	if !stillPending || current != regEntry || (expected != nil && current != expected) {
 		return types.NodeView{}, change.Change{}, hsdb.ErrNodeNotFoundRegistrationCache
 	}
 
