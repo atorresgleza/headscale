@@ -3,10 +3,16 @@ package hscontrol
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
 	"html/template"
+	"mime"
 	"net/http"
+	"strings"
+	"time"
+
+	"github.com/juanfont/headscale/hscontrol/db"
 )
 
 const localEnrollCSRFCookie = "__Secure-hs-local-enroll-csrf"
@@ -83,4 +89,71 @@ func localEnrollRandom() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(secret), nil
+}
+
+// localAuthEnrollPOST never accepts a bearer token in the URL. Its body is
+// capped before parsing; only a trusted peer and matching HTTPS Origin reach
+// the shared limiter and the atomic one-time invitation redemption.
+func (h *Headscale) localAuthEnrollPOST(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	fail := func(code int) { http.Error(w, "Unable to enroll.", code) }
+	if r.URL.RawQuery != "" || r.URL.ForceQuery || r.URL.Fragment != "" {
+		fail(http.StatusBadRequest)
+		return
+	}
+	origin := r.Header.Values("Origin")
+	if len(origin) != 1 || origin[0] != strings.TrimSuffix(h.cfg.ServerURL, "/") {
+		fail(http.StatusForbidden)
+		return
+	}
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/x-www-form-urlencoded" {
+		fail(http.StatusBadRequest)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8*1024)
+	if err := r.ParseForm(); err != nil {
+		fail(http.StatusBadRequest)
+		return
+	}
+	csrf := r.PostForm["csrf"]
+	token := r.PostForm["token"]
+	password := r.PostForm["password"]
+	if len(csrf) != 1 || len(token) != 1 || len(password) != 1 {
+		fail(http.StatusBadRequest)
+		return
+	}
+	cookie, err := r.Cookie(localEnrollCSRFCookie)
+	if err != nil || len(cookie.Value) != 43 || len(csrf[0]) != 43 ||
+		subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(csrf[0])) != 1 {
+		fail(http.StatusForbidden)
+		return
+	}
+	clientIP, ok := parsePeerAddr(r.RemoteAddr)
+	if !ok {
+		fail(http.StatusServiceUnavailable)
+		return
+	}
+	subject := token[0]
+	if subject == "" || len(subject) > 1024 {
+		subject = "invalid-invitation"
+	}
+	allowed, err := h.state.AllowLocalAuthAttempt(db.LocalAuthAttemptEnrollment, clientIP, subject, time.Now())
+	if err != nil {
+		fail(http.StatusServiceUnavailable)
+		return
+	}
+	if !allowed {
+		fail(http.StatusBadRequest)
+		return
+	}
+	if _, err := h.state.RedeemLocalInvitation(token[0], password[0]); err != nil {
+		fail(http.StatusBadRequest)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: localEnrollCSRFCookie, Value: "", Path: "/local-auth/enroll",
+		MaxAge: -1, Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	})
+	w.WriteHeader(http.StatusNoContent)
 }

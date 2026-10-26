@@ -499,6 +499,21 @@ func (s *State) IssueLocalInvitation(userID types.UserID, lifetime time.Duration
 	return s.db.IssueLocalInvitation(userID, lifetime)
 }
 
+// AllowLocalAuthAttempt delegates shared, fail-closed attempt accounting to DB.
+func (s *State) AllowLocalAuthAttempt(kind hsdb.LocalAuthAttemptKind, clientIP netip.Addr, subject string, now time.Time) (bool, error) {
+	return s.db.AllowLocalAuthAttempt(kind, clientIP, subject, now)
+}
+
+// RedeemLocalInvitation consumes the one-time secret and atomically installs
+// or replaces the local password without changing user or device identity.
+func (s *State) RedeemLocalInvitation(token, password string) (types.UserID, error) {
+	return s.db.RedeemLocalInvitation(token, password)
+}
+
+func (s *State) VerifyLocalPassword(name, password string) (bool, error) {
+	return s.db.VerifyLocalPassword(name, password)
+}
+
 // GetUserByID retrieves a user by ID.
 func (s *State) GetUserByID(userID types.UserID) (*types.User, error) {
 	return s.db.GetUserByID(userID)

@@ -4,8 +4,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/require"
@@ -92,13 +95,196 @@ func TestLocalAuthEnrollPageDisabledOrUntrusted(t *testing.T) {
 	require.NotContains(t, rec.Body.String(), "password")
 }
 
-func TestLocalAuthEnrollPOSTNotMounted(t *testing.T) {
-	app := localAuthHTTPTestApp(t, true)
-	req := httptest.NewRequest(http.MethodPost, "http://login.example.org/local-auth/enroll", strings.NewReader("token=secret&password=example"))
-	req.RemoteAddr = "10.0.0.5:1234"
+func enrollmentCSRF(t *testing.T, app *Headscale) (string, *http.Cookie) {
+	t.Helper()
+	page := localAuthGET(app, "10.0.0.5:1234")
+	require.Equal(t, http.StatusOK, page.Code)
+	match := regexp.MustCompile(`name="csrf" value="([A-Za-z0-9_-]+)"`).FindStringSubmatch(page.Body.String())
+	require.Len(t, match, 2)
+	cookies := page.Result().Cookies()
+	require.Len(t, cookies, 1)
+	return match[1], cookies[0]
+}
+
+func enrollmentPOST(app *Headscale, fields url.Values, cookie *http.Cookie, origin, remote string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "http://login.example.org/local-auth/enroll", strings.NewReader(fields.Encode()))
+	req.RemoteAddr = remote
 	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
 	rec := httptest.NewRecorder()
 	app.HTTPHandler().ServeHTTP(rec, req)
-	require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
-	require.Empty(t, rec.Result().Cookies())
+	return rec
+}
+
+func TestLocalAuthEnrollPOSTRedeemsExistingUser(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user := app.GetState().CreateUserForTest("alice")
+	token, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	csrf, cookie := enrollmentCSRF(t, app)
+	rec := enrollmentPOST(app, url.Values{"token": {token}, "password": {"correct horse battery staple"}, "csrf": {csrf}}, cookie,
+		"https://login.example.org", "10.0.0.5:1234")
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	require.Empty(t, rec.Body.String())
+	require.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+	cleared := rec.Result().Cookies()
+	require.Len(t, cleared, 1)
+	require.Equal(t, localEnrollCSRFCookie, cleared[0].Name)
+	require.Equal(t, -1, cleared[0].MaxAge)
+	require.True(t, cleared[0].Secure)
+	require.True(t, cleared[0].HttpOnly)
+	require.NotContains(t, rec.Header().Get("Location"), token)
+
+	csrf, cookie = enrollmentCSRF(t, app)
+	replay := enrollmentPOST(app, url.Values{"token": {token}, "password": {"correct horse battery staple"}, "csrf": {csrf}}, cookie,
+		"https://login.example.org", "10.0.0.5:1234")
+	require.Equal(t, http.StatusBadRequest, replay.Code)
+	require.Equal(t, "Unable to enroll.\n", replay.Body.String())
+	require.NotContains(t, replay.Body.String(), token)
+}
+
+func TestLocalAuthEnrollPOSTRejectsCSRFAndOrigin(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user := app.GetState().CreateUserForTest("alice")
+	token, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	csrf, cookie := enrollmentCSRF(t, app)
+	fields := url.Values{"token": {token}, "password": {"correct horse battery staple"}, "csrf": {csrf}}
+	for _, tc := range []struct {
+		name, origin, csrf string
+		cookie             *http.Cookie
+	}{
+		{"wrong origin", "https://attacker.example.org", csrf, cookie},
+		{"missing origin", "", csrf, cookie},
+		{"wrong csrf", "https://login.example.org", "wrong", cookie},
+		{"missing cookie", "https://login.example.org", csrf, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fields.Set("csrf", tc.csrf)
+			rec := enrollmentPOST(app, fields, tc.cookie, tc.origin, "10.0.0.5:1234")
+			require.Equal(t, http.StatusForbidden, rec.Code)
+			require.Equal(t, "Unable to enroll.\n", rec.Body.String())
+			require.NotContains(t, rec.Body.String(), token)
+		})
+	}
+	fields.Set("csrf", csrf)
+	rec := enrollmentPOST(app, fields, cookie, "https://login.example.org", "10.0.0.5:1234")
+	require.Equal(t, http.StatusNoContent, rec.Code) // rejected requests did not consume invitation
+}
+
+func TestLocalAuthEnrollPOSTLimitsAndGenericErrors(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user := app.GetState().CreateUserForTest("alice")
+	token, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	csrf, cookie := enrollmentCSRF(t, app)
+	submit := func(tok, password, remote string) *httptest.ResponseRecorder {
+		return enrollmentPOST(app, url.Values{"token": {tok}, "password": {password}, "csrf": {csrf}}, cookie,
+			"https://login.example.org", remote)
+	}
+	invalidToken := submit("not a token", "correct horse battery staple", "10.0.0.5:1234")
+	invalidPassword := submit(token, "short", "10.0.0.5:1234")
+	require.Equal(t, http.StatusBadRequest, invalidToken.Code)
+	require.Equal(t, invalidToken.Code, invalidPassword.Code)
+	require.Equal(t, invalidToken.Body.String(), invalidPassword.Body.String())
+	require.Equal(t, "Unable to enroll.\n", invalidToken.Body.String())
+	require.Equal(t, "no-store", invalidToken.Header().Get("Cache-Control"))
+	for range 4 {
+		rec := submit(token, "short", "10.0.0.5:1234")
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+	}
+	rec := submit(token, "correct horse battery staple", "10.0.0.5:1234")
+	require.Equal(t, http.StatusBadRequest, rec.Code) // shared subject cap, not credential verification
+	// A replacement invitation remains usable and does not depend on the blocked secret.
+	replacement, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	rec = submit(replacement, "correct horse battery staple", "10.0.0.5:1234")
+	require.Equal(t, http.StatusNoContent, rec.Code)
+}
+
+func TestLocalAuthEnrollPOSTBodyLimitAndStorageFailure(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user := app.GetState().CreateUserForTest("alice")
+	token, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	csrf, cookie := enrollmentCSRF(t, app)
+	oversized := enrollmentPOST(app, url.Values{"token": {token}, "password": {strings.Repeat("a", 9000)}, "csrf": {csrf}}, cookie,
+		"https://login.example.org", "10.0.0.5:1234")
+	require.Equal(t, http.StatusBadRequest, oversized.Code)
+	require.Equal(t, "Unable to enroll.\n", oversized.Body.String())
+	valid := enrollmentPOST(app, url.Values{"token": {token}, "password": {"correct horse battery staple"}, "csrf": {csrf}}, cookie,
+		"https://login.example.org", "10.0.0.5:1234")
+	require.Equal(t, http.StatusNoContent, valid.Code)
+
+	other := localAuthHTTPTestApp(t, true)
+	csrf, cookie = enrollmentCSRF(t, other)
+	require.NoError(t, other.GetState().Close())
+	unavailable := enrollmentPOST(other, url.Values{"token": {token}, "password": {"correct horse battery staple"}, "csrf": {csrf}}, cookie,
+		"https://login.example.org", "10.0.0.5:1234")
+	require.Equal(t, http.StatusServiceUnavailable, unavailable.Code)
+	require.Equal(t, "Unable to enroll.\n", unavailable.Body.String())
+}
+
+func TestLocalAuthEnrollPOSTRenewsWithoutChangingUser(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user, _, err := app.GetState().CreateUser(types.User{Name: "alice", Email: "alice@example.org"})
+	require.NoError(t, err)
+	first, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	csrf, cookie := enrollmentCSRF(t, app)
+	submit := func(token, password string) *httptest.ResponseRecorder {
+		return enrollmentPOST(app, url.Values{"token": {token}, "password": {password}, "csrf": {csrf}}, cookie,
+			"https://login.example.org", "10.0.0.5:1234")
+	}
+	require.Equal(t, http.StatusNoContent, submit(first, "first correct horse battery").Code)
+	oldValid, err := app.GetState().VerifyLocalPassword("alice", "first correct horse battery")
+	require.NoError(t, err)
+	require.True(t, oldValid)
+	second, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	csrf, cookie = enrollmentCSRF(t, app)
+	require.Equal(t, http.StatusBadRequest, submit(second, "short").Code)
+	oldValid, err = app.GetState().VerifyLocalPassword("alice", "first correct horse battery")
+	require.NoError(t, err)
+	require.True(t, oldValid)
+	require.Equal(t, http.StatusNoContent, submit(second, "second correct horse battery").Code)
+	oldValid, err = app.GetState().VerifyLocalPassword("alice", "first correct horse battery")
+	require.NoError(t, err)
+	require.False(t, oldValid)
+	newValid, err := app.GetState().VerifyLocalPassword("alice", "second correct horse battery")
+	require.NoError(t, err)
+	require.True(t, newValid)
+	stored, err := app.GetState().GetUserByID(types.UserID(user.ID))
+	require.NoError(t, err)
+	require.Equal(t, user.Name, stored.Name)
+	require.Equal(t, user.Email, stored.Email)
+}
+
+func TestLocalAuthEnrollPOSTRejectsDuplicateAndQueryToken(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user := app.GetState().CreateUserForTest("alice")
+	token, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	csrf, cookie := enrollmentCSRF(t, app)
+	fields := url.Values{"token": {token, token}, "password": {"correct horse battery staple"}, "csrf": {csrf}}
+	duplicate := enrollmentPOST(app, fields, cookie, "https://login.example.org", "10.0.0.5:1234")
+	require.Equal(t, http.StatusBadRequest, duplicate.Code)
+	require.Equal(t, "Unable to enroll.\n", duplicate.Body.String())
+	fields.Set("token", token)
+	req := httptest.NewRequest(http.MethodPost, "http://login.example.org/local-auth/enroll?token="+token, strings.NewReader(fields.Encode()))
+	req.RemoteAddr = "10.0.0.5:1234"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("Origin", "https://login.example.org")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	query := httptest.NewRecorder()
+	app.HTTPHandler().ServeHTTP(query, req)
+	require.Equal(t, http.StatusBadRequest, query.Code)
+	require.NotContains(t, query.Body.String(), token)
+	valid := enrollmentPOST(app, fields, cookie, "https://login.example.org", "10.0.0.5:1234")
+	require.Equal(t, http.StatusNoContent, valid.Code) // rejected requests did not consume invitation
 }

@@ -625,6 +625,7 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 	r.Get("/auth/{auth_id}", h.authProvider.AuthHandler)
 	if h.cfg.LocalAuth.Enabled {
 		r.Get("/local-auth/enroll", h.localAuthEnrollPage)
+		r.Post("/local-auth/enroll", h.localAuthEnrollPOST)
 	}
 
 	if provider, ok := h.authProvider.(*AuthProviderOIDC); ok {
