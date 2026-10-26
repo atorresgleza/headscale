@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"testing"
 
+	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -239,4 +240,75 @@ func TestTrustedProxyRealIPEmptyTrusted(t *testing.T) {
 	// spoofed header must be stripped and RemoteAddr left alone.
 	assert.Equal(t, "10.0.0.5:1234", observed.RemoteAddr)
 	assert.Empty(t, observed.Header.Get("X-Real-IP"))
+}
+
+// A credential route may trust forwarded HTTPS only when the original network
+// peer is an explicitly trusted proxy. Existing non-auth routes are untouched.
+func TestLocalAuthTransport(t *testing.T) {
+	tests := []struct {
+		name, remote, proto, host, path string
+		enabled                         bool
+		duplicateProto                  bool
+		wantStatus                      int
+		wantBody                        string
+	}{
+		{name: "trusted HTTPS", remote: "10.0.0.5:49152", proto: "https", host: "login.example.org", path: "/local-auth/enroll", enabled: true, wantStatus: http.StatusNoContent},
+		{name: "untrusted spoof", remote: "203.0.113.5:49152", proto: "https", host: "login.example.org", path: "/local-auth/enroll", enabled: true, wantStatus: http.StatusForbidden, wantBody: "Forbidden\n"},
+		{name: "missing proto", remote: "10.0.0.5:49152", host: "login.example.org", path: "/local-auth/enroll", enabled: true, wantStatus: http.StatusForbidden, wantBody: "Forbidden\n"},
+		{name: "plain HTTP", remote: "10.0.0.5:49152", proto: "http", host: "login.example.org", path: "/local-auth/enroll", enabled: true, wantStatus: http.StatusForbidden, wantBody: "Forbidden\n"},
+		{name: "duplicate proto", remote: "10.0.0.5:49152", proto: "https", host: "login.example.org", path: "/local-auth/enroll", enabled: true, duplicateProto: true, wantStatus: http.StatusForbidden, wantBody: "Forbidden\n"},
+		{name: "wrong host", remote: "10.0.0.5:49152", proto: "https", host: "other.example.org", path: "/local-auth/enroll", enabled: true, wantStatus: http.StatusForbidden, wantBody: "Forbidden\n"},
+		{name: "disabled", remote: "10.0.0.5:49152", proto: "https", host: "login.example.org", path: "/local-auth/enroll", wantStatus: http.StatusNotFound, wantBody: "404 page not found\n"},
+		{name: "existing route unchanged", remote: "203.0.113.5:49152", proto: "http", host: "other.example.org", path: "/health", wantStatus: http.StatusNoContent},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &types.Config{
+				ServerURL:      "https://login.example.org",
+				LocalAuth:      types.LocalAuthConfig{Enabled: tc.enabled},
+				TrustedProxies: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")},
+			}
+			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			})
+			req := httptest.NewRequest(http.MethodGet, "http://login.example.org"+tc.path, nil)
+			req.RemoteAddr = tc.remote
+			req.Host = tc.host
+			if tc.proto != "" {
+				req.Header.Set("X-Forwarded-Proto", tc.proto)
+			}
+			if tc.duplicateProto {
+				req.Header.Add("X-Forwarded-Proto", "http")
+			}
+			rec := httptest.NewRecorder()
+			localAuthTransport(cfg)(next).ServeHTTP(rec, req)
+			assert.Equal(t, tc.wantStatus, rec.Code)
+			assert.Equal(t, tc.wantBody, rec.Body.String())
+		})
+	}
+}
+
+func TestLocalAuthConfigRequirements(t *testing.T) {
+	trusted := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}
+	cases := []struct {
+		name    string
+		cfg     types.Config
+		wantErr string
+	}{
+		{name: "disabled leaves HTTP CLI mode alone", cfg: types.Config{ServerURL: "http://127.0.0.1:8080"}},
+		{name: "enabled needs HTTPS", cfg: types.Config{ServerURL: "http://login.example.org", TrustedProxies: trusted, LocalAuth: types.LocalAuthConfig{Enabled: true}}, wantErr: "local auth requires a plain HTTPS server_url"},
+		{name: "enabled needs trusted peer ranges", cfg: types.Config{ServerURL: "https://login.example.org", LocalAuth: types.LocalAuthConfig{Enabled: true}}, wantErr: "local auth requires trusted_proxies"},
+		{name: "enabled rejects OIDC coexistence", cfg: types.Config{ServerURL: "https://login.example.org", TrustedProxies: trusted, LocalAuth: types.LocalAuthConfig{Enabled: true}, OIDC: types.OIDCConfig{Issuer: "https://oidc.example.org"}}, wantErr: "local auth cannot be enabled with OIDC"},
+		{name: "enabled accepts restricted trusted proxy", cfg: types.Config{ServerURL: "https://login.example.org", TrustedProxies: trusted, LocalAuth: types.LocalAuthConfig{Enabled: true}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateLocalAuthConfig(&tc.cfg)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, err, tc.wantErr)
+			}
+		})
+	}
 }

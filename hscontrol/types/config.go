@@ -131,7 +131,8 @@ type Config struct {
 	UnixSocket           string
 	UnixSocketPermission fs.FileMode
 
-	OIDC OIDCConfig
+	OIDC      OIDCConfig
+	LocalAuth LocalAuthConfig
 
 	LogTail    LogTailConfig
 	Taildrop   TaildropConfig
@@ -229,6 +230,12 @@ type OIDCConfig struct {
 	EmailVerifiedRequired      bool
 	UseExpiryFromToken         bool
 	PKCE                       PKCEConfig
+}
+
+// LocalAuthConfig enables the opt-in browser password flow only with a
+// configured HTTPS reverse proxy. A false zero value keeps existing routes.
+type LocalAuthConfig struct {
+	Enabled bool
 }
 
 type DERPConfig struct {
@@ -1252,6 +1259,8 @@ func LoadServerConfig() (*Config, error) {
 
 		UnixSocket:           viper.GetString("unix_socket"),
 		UnixSocketPermission: util.GetFileMode("unix_socket_permission"),
+
+		LocalAuth: LocalAuthConfig{Enabled: viper.GetBool("local_auth.enabled")},
 
 		OIDC: OIDCConfig{
 			OnlyStartIfOIDCIsAvailable: viper.GetBool(

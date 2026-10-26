@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof" // nolint
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -121,6 +122,10 @@ var (
 )
 
 func NewHeadscale(cfg *types.Config) (*Headscale, error) {
+	if err := validateLocalAuthConfig(cfg); err != nil {
+		return nil, err
+	}
+
 	var err error
 
 	if profilingEnabled {
@@ -511,6 +516,59 @@ func (h *Headscale) ensureUnixSocketIsAbsent() error {
 	return os.Remove(h.cfg.UnixSocket)
 }
 
+// validateLocalAuthConfig fails before starting the server or writing state.
+// This cannot prove the live proxy sets the forwarded header correctly or
+// restricts direct backend ingress; the operator verifies those before release.
+func validateLocalAuthConfig(cfg *types.Config) error {
+	if !cfg.LocalAuth.Enabled {
+		return nil
+	}
+	origin, err := url.Parse(cfg.ServerURL)
+	if err != nil || origin.Scheme != "https" || origin.Hostname() == "" ||
+		origin.User != nil || origin.Opaque != "" || origin.RawQuery != "" ||
+		origin.ForceQuery || origin.Fragment != "" || origin.RawFragment != "" ||
+		origin.RawPath != "" || (origin.Path != "" && origin.Path != "/") {
+		return errors.New("local auth requires a plain HTTPS server_url")
+	}
+	if len(cfg.TrustedProxies) == 0 {
+		return errors.New("local auth requires trusted_proxies")
+	}
+	for _, prefix := range cfg.TrustedProxies {
+		if prefix.Bits() == 0 {
+			return errors.New("local auth requires restricted trusted_proxies")
+		}
+	}
+	if cfg.OIDC.Issuer != "" {
+		return errors.New("local auth cannot be enabled with OIDC")
+	}
+	return nil
+}
+
+// localAuthTransport runs before trustedProxyRealIP can replace RemoteAddr.
+// It protects the reserved /local-auth/ path even before enrollment is mounted.
+func localAuthTransport(cfg *types.Config) func(http.Handler) http.Handler {
+	origin, _ := url.Parse(cfg.ServerURL) // validated at startup when enabled
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !strings.HasPrefix(r.URL.Path, "/local-auth/") {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if !cfg.LocalAuth.Enabled {
+				http.NotFound(w, r)
+				return
+			}
+			proto := r.Header.Values("X-Forwarded-Proto")
+			if !peerTrusted(r.RemoteAddr, cfg.TrustedProxies) || len(proto) != 1 ||
+				proto[0] != "https" || origin == nil || r.Host != origin.Host {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // securityHeaders sets baseline response headers on every HTTP response:
 // deny framing (clickjacking), forbid MIME-type sniffing, drop the Referer
 // header on outbound navigation. Cheap defense-in-depth for HTML surfaces.
@@ -535,6 +593,7 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 		},
 	}))
 	r.Use(middleware.RequestID)
+	r.Use(localAuthTransport(h.cfg)) // preserve the network peer before real-IP rewriting
 
 	if h.realIPMiddleware != nil {
 		r.Use(h.realIPMiddleware)
