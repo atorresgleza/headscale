@@ -513,3 +513,35 @@ func TestLocalAuthDeviceLoginRejectsBadInputAndSharedLimit(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, rec.Code) // shared login-name limit, even across auth IDs
 	require.Equal(t, "Unable to sign in.\n", rec.Body.String())
 }
+
+func TestLocalAuthDeviceLoginRejectsEvictedAndNonRegistrationAuthID(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	nonRegistration := types.MustAuthID()
+	app.GetState().SetAuthCacheEntry(nonRegistration,
+		types.NewSSHCheckAuthRequest(types.NodeID(1), types.NodeID(2)))
+	rec := localAuthRegisterGET(app, nonRegistration, "10.0.0.5:1234")
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Empty(t, rec.Result().Cookies())
+	post := localAuthLoginPOST(app, nonRegistration,
+		url.Values{"name": {"alice"}, "password": {"correct horse battery staple"}, "csrf": {"irrelevant"}},
+		nil, "https://login.example.org")
+	require.Equal(t, http.StatusNotFound, post.Code)
+	require.Empty(t, post.Result().Cookies())
+
+	first := localAuthPendingDevice(app)
+	page := localAuthRegisterGET(app, first, "10.0.0.5:1234")
+	require.Equal(t, http.StatusOK, page.Code)
+	require.Len(t, page.Result().Cookies(), 1)
+	csrf := page.Result().Cookies()[0]
+	for range 1025 {
+		localAuthPendingDevice(app)
+	} // exceeds the bounded auth-cache capacity
+	rec = localAuthRegisterGET(app, first, "10.0.0.5:1234")
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Empty(t, rec.Result().Cookies())
+	post = localAuthLoginPOST(app, first,
+		url.Values{"name": {"alice"}, "password": {"correct horse battery staple"}, "csrf": {csrf.Value}},
+		csrf, "https://login.example.org")
+	require.Equal(t, http.StatusNotFound, post.Code)
+	require.Empty(t, post.Result().Cookies())
+}
