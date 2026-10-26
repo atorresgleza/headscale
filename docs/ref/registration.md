@@ -93,14 +93,14 @@ headscale users create <USER>
 
 ### Local password invitation (fork development only)
 
-This fork has an administrator-only CLI command for an **existing** local user. It does not create a user, change an email address, send email, or register a device. The reserved enrollment page is **not implemented yet**: do not send the resulting link to users or deploy this intermediate build. The command issues a new one-time secret; issuing another invitation replaces the prior outstanding link. It can also be used to renew a password after enrollment is available.
+This fork has an administrator-only CLI command for an **existing** local user. It does not create a user, change an email address, send email, or register a device. An opt-in GET page now renders, but it **cannot enroll a password**: the POST redemption path is not implemented. Do not send the resulting link to users or deploy this intermediate build. The command issues a new one-time secret; issuing another invitation replaces the prior outstanding link. It can also be used to renew a password after enrollment is available.
 
 ```console
 headscale users invite --identifier <USER_ID> --origin https://<HEADSCALE_HOST> --lifetime 24h
 # The same operation is available as: headscale users renew-password
 ```
 
-`--origin` may be omitted only if the configured `server_url` is a plain HTTPS origin with an ICANN-registrable DNS hostname; IP literals, non-ICANN/private suffixes, `.onion` and infrastructure `.arpa` names are refused. The CLI does not resolve DNS or verify TLS, so the operator must verify public reachability and the certificate before deployment. The maximum lifetime is `168h`; `--lifetime` requires whole seconds. The CLI displays the link once on stdout (or in `--output json`, `json-line`, or `yaml`), and it must be delivered manually through a trusted channel. Its secret is in the URL fragment, not the HTTP path or query. Treat saved terminal output and structured output as credentials; do not paste them into logs. The future enrollment page and its HTTPS, CSRF and rate-limit protections belong to a separate stage. Existing CLI and OIDC registration continue unchanged.
+`--origin` may be omitted only if the configured `server_url` is a plain HTTPS origin with an ICANN-registrable DNS hostname; IP literals, non-ICANN/private suffixes, `.onion` and infrastructure `.arpa` names are refused. The CLI does not resolve DNS or verify TLS, so the operator must verify public reachability and the certificate before deployment. The maximum lifetime is `168h`; `--lifetime` requires whole seconds. The CLI displays the link once on stdout (or in `--output json`, `json-line`, or `yaml`), and it must be delivered manually through a trusted channel. Its secret is in the URL fragment, not the HTTP path or query. Treat saved terminal output and structured output as credentials; do not paste them into logs. The page removes the URL fragment in a first-party script and sets a Secure CSRF cookie; its shared rate-limit storage exists, but POST integration and end-to-end HTTPS/CSRF/security verification remain pending. Existing CLI and OIDC registration continue unchanged.
 
 ### Pre authenticated key
 
