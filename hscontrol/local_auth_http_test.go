@@ -63,11 +63,14 @@ func TestLocalAuthEnrollPage(t *testing.T) {
 
 	cookies := rec.Result().Cookies()
 	require.Len(t, cookies, 1)
-	require.Equal(t, "__Secure-hs-local-enroll-csrf", cookies[0].Name)
+	require.Equal(t, "__Host-hs-local-enroll-csrf", cookies[0].Name)
+	require.Equal(t, "/", cookies[0].Path)
+	require.Empty(t, cookies[0].Domain)
+	require.True(t, cookies[0].Secure)
 	require.True(t, cookies[0].Secure)
 	require.True(t, cookies[0].HttpOnly)
 	require.Equal(t, http.SameSiteStrictMode, cookies[0].SameSite)
-	require.Equal(t, "/local-auth/enroll", cookies[0].Path)
+	require.Equal(t, "/", cookies[0].Path)
 	require.Equal(t, 600, cookies[0].MaxAge)
 	nonceMarker := "script-src 'nonce-"
 	nonceStart := strings.Index(csp, nonceMarker) + len(nonceMarker)
@@ -135,6 +138,8 @@ func TestLocalAuthEnrollPOSTRedeemsExistingUser(t *testing.T) {
 	require.Len(t, cleared, 1)
 	require.Equal(t, localEnrollCSRFCookie, cleared[0].Name)
 	require.Equal(t, -1, cleared[0].MaxAge)
+	require.Equal(t, "/", cleared[0].Path)
+	require.Empty(t, cleared[0].Domain)
 	require.True(t, cleared[0].Secure)
 	require.True(t, cleared[0].HttpOnly)
 	require.NotContains(t, rec.Header().Get("Location"), token)
@@ -287,4 +292,41 @@ func TestLocalAuthEnrollPOSTRejectsDuplicateAndQueryToken(t *testing.T) {
 	require.NotContains(t, query.Body.String(), token)
 	valid := enrollmentPOST(app, fields, cookie, "https://login.example.org", "10.0.0.5:1234")
 	require.Equal(t, http.StatusNoContent, valid.Code) // rejected requests did not consume invitation
+}
+
+func TestLocalAuthEnrollPOSTRejectsDuplicateCSRFCookies(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		poisonFirst bool
+	}{
+		{"poison before host", true}, {"poison after host", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := localAuthHTTPTestApp(t, true)
+			user := app.GetState().CreateUserForTest("alice")
+			token, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+			require.NoError(t, err)
+			csrf, cookie := enrollmentCSRF(t, app)
+			fields := url.Values{"token": {token}, "password": {"correct horse battery staple"}, "csrf": {csrf}}
+			req := httptest.NewRequest(http.MethodPost, "http://login.example.org/local-auth/enroll", strings.NewReader(fields.Encode()))
+			req.RemoteAddr = "10.0.0.5:1234"
+			req.Header.Set("X-Forwarded-Proto", "https")
+			req.Header.Set("Origin", "https://login.example.org")
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			poison := &http.Cookie{Name: cookie.Name, Value: "poison"}
+			if tc.poisonFirst {
+				req.AddCookie(poison)
+				req.AddCookie(cookie)
+			} else {
+				req.AddCookie(cookie)
+				req.AddCookie(poison)
+			}
+			rejected := httptest.NewRecorder()
+			app.HTTPHandler().ServeHTTP(rejected, req)
+			require.Equal(t, http.StatusForbidden, rejected.Code)
+			require.Equal(t, "Unable to enroll.\n", rejected.Body.String())
+			valid := enrollmentPOST(app, fields, cookie, "https://login.example.org", "10.0.0.5:1234")
+			require.Equal(t, http.StatusNoContent, valid.Code) // duplicate never consumes invitation
+		})
+	}
 }

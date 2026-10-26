@@ -15,7 +15,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/db"
 )
 
-const localEnrollCSRFCookie = "__Secure-hs-local-enroll-csrf"
+const localEnrollCSRFCookie = "__Host-hs-local-enroll-csrf"
 
 var localEnrollPage = template.Must(template.New("local-enroll").Parse(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -76,7 +76,7 @@ func (h *Headscale) localAuthEnrollPage(w http.ResponseWriter, r *http.Request) 
 		"default-src 'none'; script-src 'nonce-%s'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'", nonce,
 	))
 	http.SetCookie(w, &http.Cookie{
-		Name: localEnrollCSRFCookie, Value: csrf, Path: "/local-auth/enroll",
+		Name: localEnrollCSRFCookie, Value: csrf, Path: "/",
 		MaxAge: 600, Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
 	})
 	w.WriteHeader(http.StatusOK)
@@ -123,9 +123,9 @@ func (h *Headscale) localAuthEnrollPOST(w http.ResponseWriter, r *http.Request) 
 		fail(http.StatusBadRequest)
 		return
 	}
-	cookie, err := r.Cookie(localEnrollCSRFCookie)
-	if err != nil || len(cookie.Value) != 43 || len(csrf[0]) != 43 ||
-		subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(csrf[0])) != 1 {
+	cookies := r.CookiesNamed(localEnrollCSRFCookie)
+	if len(cookies) != 1 || len(cookies[0].Value) != 43 || len(csrf[0]) != 43 ||
+		subtle.ConstantTimeCompare([]byte(cookies[0].Value), []byte(csrf[0])) != 1 {
 		fail(http.StatusForbidden)
 		return
 	}
@@ -152,7 +152,7 @@ func (h *Headscale) localAuthEnrollPOST(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name: localEnrollCSRFCookie, Value: "", Path: "/local-auth/enroll",
+		Name: localEnrollCSRFCookie, Value: "", Path: "/",
 		MaxAge: -1, Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
 	})
 	w.WriteHeader(http.StatusNoContent)
