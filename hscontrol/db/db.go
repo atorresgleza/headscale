@@ -815,6 +815,13 @@ WHERE tags IS NOT NULL AND tags != '[]' AND tags != '' AND tags != 'null'
 				},
 				Rollback: func(db *gorm.DB) error { return nil },
 			},
+			{
+				ID: "202610261200-local-auth-attempts",
+				Migrate: func(tx *gorm.DB) error {
+					return createLocalAuthAttemptTable(tx)
+				},
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
 		},
 	)
 
@@ -832,6 +839,9 @@ WHERE tags IS NOT NULL AND tags != '[]' AND tags != '' AND tags != 'null'
 		}
 
 		if err := createLocalAuthTables(tx); err != nil {
+			return err
+		}
+		if err := createLocalAuthAttemptTable(tx); err != nil {
 			return err
 		}
 

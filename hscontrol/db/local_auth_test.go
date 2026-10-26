@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -267,4 +269,155 @@ func TestLocalInvitationResetKeepsOldPasswordUntilRedeemed(t *testing.T) {
 	valid, err = database.VerifyLocalPassword("alice", "a different correct password")
 	require.NoError(t, err)
 	require.True(t, valid)
+}
+
+func TestLocalAuthAttemptLimitsSQLite(t *testing.T) {
+	database, err := newSQLiteTestDB()
+	require.NoError(t, err)
+	now := time.Date(2026, time.October, 26, 12, 0, 0, 0, time.UTC)
+	ip := netip.MustParseAddr("203.0.113.10")
+	otherIP := netip.MustParseAddr("203.0.113.11")
+	for range 5 {
+		allowed, err := database.AllowLocalAuthAttempt(LocalAuthAttemptEnrollment, ip, "secret bearer", now)
+		require.NoError(t, err)
+		require.True(t, allowed)
+	}
+	allowed, err := database.AllowLocalAuthAttempt(LocalAuthAttemptEnrollment, ip, "secret bearer", now)
+	require.NoError(t, err)
+	require.False(t, allowed)
+	allowed, err = database.AllowLocalAuthAttempt(LocalAuthAttemptEnrollment, otherIP, "secret bearer", now)
+	require.NoError(t, err)
+	require.False(t, allowed) // subject limit is shared by client IPs
+	allowed, err = database.AllowLocalAuthAttempt(LocalAuthAttemptEnrollment, otherIP, "different secret", now)
+	require.NoError(t, err)
+	require.True(t, allowed) // blocked attempt rolled back the other IP's counter
+	allowed, err = database.AllowLocalAuthAttempt(LocalAuthAttemptLogin, ip, "alice", now)
+	require.NoError(t, err)
+	require.True(t, allowed) // independent kind
+	allowed, err = database.AllowLocalAuthAttempt(LocalAuthAttemptEnrollment, ip, "secret bearer", now.Add(5*time.Minute))
+	require.NoError(t, err)
+	require.True(t, allowed) // exact expiry resets the window
+
+	for _, bad := range []struct {
+		kind    LocalAuthAttemptKind
+		ip      netip.Addr
+		subject string
+	}{
+		{LocalAuthAttemptKind("unknown"), ip, "alice"},
+		{LocalAuthAttemptEnrollment, netip.Addr{}, "alice"},
+		{LocalAuthAttemptEnrollment, ip, ""},
+		{LocalAuthAttemptEnrollment, ip, strings.Repeat("a", 1025)},
+	} {
+		allowed, err := database.AllowLocalAuthAttempt(bad.kind, bad.ip, bad.subject, now)
+		require.Error(t, err)
+		require.False(t, allowed)
+	}
+}
+
+func TestLocalAuthAttemptIPLimitAndFailure(t *testing.T) {
+	database, err := newSQLiteTestDB()
+	require.NoError(t, err)
+	ip := netip.MustParseAddr("203.0.113.10")
+	now := time.Date(2026, time.October, 26, 12, 0, 0, 0, time.UTC)
+	for i := range 30 {
+		allowed, err := database.AllowLocalAuthAttempt(LocalAuthAttemptEnrollment, ip, fmt.Sprintf("token-%d", i), now)
+		require.NoError(t, err)
+		require.True(t, allowed)
+	}
+	allowed, err := database.AllowLocalAuthAttempt(LocalAuthAttemptEnrollment, ip, "new token", now)
+	require.NoError(t, err)
+	require.False(t, allowed)
+	require.NoError(t, database.Close())
+	allowed, err = database.AllowLocalAuthAttempt(LocalAuthAttemptEnrollment, ip, "new token", now)
+	require.Error(t, err)
+	require.False(t, allowed) // storage failure cannot permit an attempt
+}
+
+func TestLocalAuthAttemptPostgresConcurrentLimit(t *testing.T) {
+	database := newPostgresTestDB(t)
+	ip := netip.MustParseAddr("203.0.113.10")
+	now := time.Date(2026, time.October, 26, 12, 0, 0, 0, time.UTC)
+	start := make(chan struct{})
+	results := make(chan bool, 20)
+	failures := make(chan error, 20)
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			allowed, err := database.AllowLocalAuthAttempt(LocalAuthAttemptEnrollment, ip, "shared secret", now)
+			results <- allowed
+			failures <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(failures)
+	successes := 0
+	for err := range failures {
+		require.NoError(t, err)
+	}
+	for allowed := range results {
+		if allowed {
+			successes++
+		}
+	}
+	require.Equal(t, 5, successes)
+}
+
+func TestLocalAuthAttemptPostgresUpgradePreservesUser(t *testing.T) {
+	postgresURL := newPostgresDBForTest(t)
+	database := newHeadscaleDBFromPostgresURL(t, postgresURL)
+	user := database.CreateUserForTest("alice")
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("DROP TABLE local_auth_attempts").Error; err != nil {
+			return err
+		}
+		result := tx.Exec("DELETE FROM migrations WHERE id = ?", "202610261200-local-auth-attempts")
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("expected one limiter migration marker, got %d", result.RowsAffected)
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.NoError(t, database.Close())
+	upgraded := newHeadscaleDBFromPostgresURL(t, postgresURL)
+	stored, err := upgraded.GetUserByID(types.UserID(user.ID))
+	require.NoError(t, err)
+	require.Equal(t, user.Name, stored.Name)
+	allowed, err := upgraded.AllowLocalAuthAttempt(LocalAuthAttemptEnrollment, netip.MustParseAddr("203.0.113.10"), "secret", time.Now())
+	require.NoError(t, err)
+	require.True(t, allowed)
+}
+
+func TestLocalAuthAttemptBlockedRollsBackIP(t *testing.T) {
+	database, err := newSQLiteTestDB()
+	require.NoError(t, err)
+	ip := netip.MustParseAddr("203.0.113.10")
+	otherIP := netip.MustParseAddr("203.0.113.11")
+	now := time.Date(2026, time.October, 26, 12, 0, 0, 0, time.UTC)
+	for range 5 {
+		allowed, err := database.AllowLocalAuthAttempt(LocalAuthAttemptEnrollment, ip, "limited subject", now)
+		require.NoError(t, err)
+		require.True(t, allowed)
+	}
+	for i := range 29 {
+		allowed, err := database.AllowLocalAuthAttempt(LocalAuthAttemptEnrollment, otherIP, fmt.Sprintf("other-%d", i), now)
+		require.NoError(t, err)
+		require.True(t, allowed)
+	}
+	allowed, err := database.AllowLocalAuthAttempt(LocalAuthAttemptEnrollment, otherIP, "limited subject", now)
+	require.NoError(t, err)
+	require.False(t, allowed)
+	allowed, err = database.AllowLocalAuthAttempt(LocalAuthAttemptEnrollment, otherIP, "thirtieth subject", now)
+	require.NoError(t, err)
+	require.True(t, allowed) // rejected subject did not consume the final IP allowance
+	allowed, err = database.AllowLocalAuthAttempt(LocalAuthAttemptEnrollment, otherIP, "thirty-first subject", now)
+	require.NoError(t, err)
+	require.False(t, allowed)
 }

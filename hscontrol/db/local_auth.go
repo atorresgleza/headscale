@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -19,17 +20,22 @@ import (
 )
 
 const (
-	localPasswordMinBytes = 15
-	localPasswordMaxBytes = 1024
-	localInvitationMaxAge = 7 * 24 * time.Hour
-	localArgonMemory      = 19 * 1024
-	localArgonIterations  = 2
-	localArgonThreads     = 1
+	localPasswordMinBytes  = 15
+	localPasswordMaxBytes  = 1024
+	localInvitationMaxAge  = 7 * 24 * time.Hour
+	localArgonMemory       = 19 * 1024
+	localArgonIterations   = 2
+	localArgonThreads      = 1
+	localAttemptWindow     = 5 * time.Minute
+	localAttemptIPMax      = 30
+	localAttemptSubjectMax = 5
 )
 
 var (
-	ErrInvalidLocalInvitation = errors.New("invalid or expired local invitation")
-	ErrInvalidLocalPassword   = errors.New("invalid local password")
+	ErrInvalidLocalInvitation  = errors.New("invalid or expired local invitation")
+	ErrInvalidLocalPassword    = errors.New("invalid local password")
+	ErrInvalidLocalAuthAttempt = errors.New("invalid local authentication attempt")
+	errLocalAuthAttemptLimited = errors.New("local authentication attempt limit reached")
 )
 
 // createLocalAuthTables uses identical SQL for SQLite and PostgreSQL. Keep the
@@ -52,6 +58,92 @@ func createLocalAuthTables(tx *gorm.DB) error {
 	}
 
 	return nil
+}
+
+// LocalAuthAttemptKind separates enrollment and login counters without storing
+// either raw invitation tokens or user names in the shared database.
+type LocalAuthAttemptKind string
+
+const (
+	LocalAuthAttemptEnrollment LocalAuthAttemptKind = "enrollment"
+	LocalAuthAttemptLogin      LocalAuthAttemptKind = "login"
+)
+
+func createLocalAuthAttemptTable(tx *gorm.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS local_auth_attempts (
+            key_hash text PRIMARY KEY,
+            attempts integer NOT NULL,
+            expires_at timestamp NOT NULL
+        )`,
+		`CREATE INDEX IF NOT EXISTS idx_local_auth_attempts_expires_at
+            ON local_auth_attempts(expires_at)`,
+	} {
+		if err := tx.Exec(statement).Error; err != nil {
+			return fmt.Errorf("creating local authentication attempt table: %w", err)
+		}
+	}
+	return nil
+}
+
+// AllowLocalAuthAttempt atomically consumes one IP and one subject allowance
+// across server instances. False or an error both mean refuse authentication.
+// The caller must pass the trusted resolved client IP and server clock time.
+func (hsdb *HSDatabase) AllowLocalAuthAttempt(
+	kind LocalAuthAttemptKind, clientIP netip.Addr, subject string, now time.Time,
+) (bool, error) {
+	if (kind != LocalAuthAttemptEnrollment && kind != LocalAuthAttemptLogin) ||
+		!clientIP.IsValid() || clientIP.IsUnspecified() ||
+		subject == "" || len(subject) > 1024 || now.IsZero() {
+		return false, ErrInvalidLocalAuthAttempt
+	}
+	clientIP = clientIP.Unmap()
+	now = now.UTC()
+	expires := now.Add(localAttemptWindow)
+	keys := []struct {
+		hash  string
+		limit int
+	}{
+		{localAuthAttemptKey(kind, "ip", clientIP.String()), localAttemptIPMax},
+		{localAuthAttemptKey(kind, "subject", subject), localAttemptSubjectMax},
+	}
+	err := hsdb.Write(func(tx *gorm.DB) error {
+		if err := tx.Exec("DELETE FROM local_auth_attempts WHERE expires_at <= ?", now).Error; err != nil {
+			return fmt.Errorf("cleaning expired local authentication attempts: %w", err)
+		}
+		for _, key := range keys {
+			var row struct{ Attempts int }
+			result := tx.Raw(`INSERT INTO local_auth_attempts (key_hash, attempts, expires_at)
+                VALUES (?, 1, ?)
+                ON CONFLICT(key_hash) DO UPDATE SET
+                    attempts = CASE WHEN local_auth_attempts.expires_at <= ?
+                        THEN 1 ELSE local_auth_attempts.attempts + 1 END,
+                    expires_at = CASE WHEN local_auth_attempts.expires_at <= ?
+                        THEN excluded.expires_at ELSE local_auth_attempts.expires_at END
+                WHERE local_auth_attempts.expires_at <= ?
+                    OR local_auth_attempts.attempts < ?
+                RETURNING attempts`, key.hash, expires, now, now, now, key.limit).Scan(&row)
+			if result.Error != nil {
+				return fmt.Errorf("recording local authentication attempt: %w", result.Error)
+			}
+			if result.RowsAffected != 1 {
+				return errLocalAuthAttemptLimited
+			}
+		}
+		return nil
+	})
+	if errors.Is(err, errLocalAuthAttemptLimited) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func localAuthAttemptKey(kind LocalAuthAttemptKind, dimension, value string) string {
+	digest := sha256.Sum256([]byte(string(kind) + "\x00" + dimension + "\x00" + value))
+	return hex.EncodeToString(digest[:])
 }
 
 // IssueLocalInvitation creates a single outstanding invitation for an existing

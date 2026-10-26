@@ -49,6 +49,13 @@ CREATE TABLE local_invitations (
   expires_at timestamp NOT NULL
 );
 
+CREATE TABLE local_auth_attempts (
+  key_hash text PRIMARY KEY,
+  attempts integer NOT NULL,
+  expires_at timestamp NOT NULL
+);
+CREATE INDEX idx_local_auth_attempts_expires_at ON local_auth_attempts(expires_at);
+
 CREATE TABLE pre_auth_keys(
   id integer PRIMARY KEY AUTOINCREMENT,
   key text,

@@ -22,4 +22,4 @@ RUN go test -c -o /usr/local/bin/headscale-db.test ./hscontrol/db
 
 WORKDIR /src/hscontrol/db
 USER postgres
-CMD ["/usr/local/bin/headscale-db.test", "-test.v", "-test.count=1", "-test.run=^TestLocalInvitation"]
+CMD ["/usr/local/bin/headscale-db.test", "-test.v", "-test.count=1", "-test.run=^TestLocal(Invitation|AuthAttempt)"]
