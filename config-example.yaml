@@ -381,7 +381,8 @@ unix_socket_permission: "0770"
 # Local password enrollment is disabled by default. Do not enable until the
 # enrollment page and shared attempt limiter have passed T2d verification.
 # HTTPS must terminate at a reverse proxy whose source CIDR is listed in
-# trusted_proxies above. The proxy must overwrite X-Forwarded-Proto with https
+# trusted_proxies above as an exact host CIDR (/32 or /128), not a range.
+# The proxy must overwrite X-Forwarded-Proto with https
 # and block direct public access to the Headscale backend.
 # local_auth:
 #   enabled: false

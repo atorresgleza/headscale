@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"testing"
 
+	grpcRuntime "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -289,7 +290,7 @@ func TestLocalAuthTransport(t *testing.T) {
 }
 
 func TestLocalAuthConfigRequirements(t *testing.T) {
-	trusted := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}
+	trusted := []netip.Prefix{netip.MustParsePrefix("10.0.0.5/32")}
 	cases := []struct {
 		name    string
 		cfg     types.Config
@@ -298,6 +299,8 @@ func TestLocalAuthConfigRequirements(t *testing.T) {
 		{name: "disabled leaves HTTP CLI mode alone", cfg: types.Config{ServerURL: "http://127.0.0.1:8080"}},
 		{name: "enabled needs HTTPS", cfg: types.Config{ServerURL: "http://login.example.org", TrustedProxies: trusted, LocalAuth: types.LocalAuthConfig{Enabled: true}}, wantErr: "local auth requires a plain HTTPS server_url"},
 		{name: "enabled needs trusted peer ranges", cfg: types.Config{ServerURL: "https://login.example.org", LocalAuth: types.LocalAuthConfig{Enabled: true}}, wantErr: "local auth requires trusted_proxies"},
+		{name: "two broad ranges cover every IPv4 peer", cfg: types.Config{ServerURL: "https://login.example.org", TrustedProxies: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/1"), netip.MustParsePrefix("128.0.0.0/1")}, LocalAuth: types.LocalAuthConfig{Enabled: true}}, wantErr: "local auth requires exact proxy host prefixes"},
+		{name: "one broad proxy range", cfg: types.Config{ServerURL: "https://login.example.org", TrustedProxies: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}, LocalAuth: types.LocalAuthConfig{Enabled: true}}, wantErr: "local auth requires exact proxy host prefixes"},
 		{name: "enabled rejects OIDC coexistence", cfg: types.Config{ServerURL: "https://login.example.org", TrustedProxies: trusted, LocalAuth: types.LocalAuthConfig{Enabled: true}, OIDC: types.OIDCConfig{Issuer: "https://oidc.example.org"}}, wantErr: "local auth cannot be enabled with OIDC"},
 		{name: "enabled accepts restricted trusted proxy", cfg: types.Config{ServerURL: "https://login.example.org", TrustedProxies: trusted, LocalAuth: types.LocalAuthConfig{Enabled: true}}},
 	}
@@ -308,6 +311,40 @@ func TestLocalAuthConfigRequirements(t *testing.T) {
 				require.NoError(t, err)
 			} else {
 				require.EqualError(t, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestLocalAuthRouterHeaders(t *testing.T) {
+	trusted := []netip.Prefix{netip.MustParsePrefix("10.0.0.5/32")}
+	cases := []struct {
+		name       string
+		enabled    bool
+		remote     string
+		wantStatus int
+	}{
+		{name: "disabled keeps existing 404 headers", remote: "203.0.113.9:1234", wantStatus: http.StatusNotFound},
+		{name: "enabled denial has security headers", enabled: true, remote: "203.0.113.9:1234", wantStatus: http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &types.Config{ServerURL: "https://login.example.org", TrustedProxies: trusted, LocalAuth: types.LocalAuthConfig{Enabled: tc.enabled}}
+			realIP, err := trustedProxyRealIP(trusted)
+			require.NoError(t, err)
+			h := &Headscale{cfg: cfg, realIPMiddleware: realIP, authProvider: NewAuthProviderWeb(cfg.ServerURL)}
+			router := h.createRouter(grpcRuntime.NewServeMux())
+			req := httptest.NewRequest(http.MethodGet, "http://login.example.org/local-auth/enroll", nil)
+			req.RemoteAddr = tc.remote
+			req.Header.Set("X-Forwarded-Proto", "https")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			require.Equal(t, tc.wantStatus, rec.Code)
+			assert.Equal(t, "DENY", rec.Header().Get("X-Frame-Options"))
+			assert.Equal(t, "frame-ancestors 'none'", rec.Header().Get("Content-Security-Policy"))
+			assert.Equal(t, "no-referrer", rec.Header().Get("Referrer-Policy"))
+			if !tc.enabled {
+				assert.Equal(t, "404 page not found\n", rec.Body.String())
 			}
 		})
 	}

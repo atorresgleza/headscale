@@ -534,8 +534,8 @@ func validateLocalAuthConfig(cfg *types.Config) error {
 		return errors.New("local auth requires trusted_proxies")
 	}
 	for _, prefix := range cfg.TrustedProxies {
-		if prefix.Bits() == 0 {
-			return errors.New("local auth requires restricted trusted_proxies")
+		if !prefix.IsValid() || prefix.Bits() != prefix.Addr().BitLen() {
+			return errors.New("local auth requires exact proxy host prefixes")
 		}
 	}
 	if cfg.OIDC.Issuer != "" {
@@ -593,7 +593,12 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 		},
 	}))
 	r.Use(middleware.RequestID)
-	r.Use(localAuthTransport(h.cfg)) // preserve the network peer before real-IP rewriting
+	if h.cfg.LocalAuth.Enabled {
+		// Secure responses for rejected local-auth requests before they reach
+		// the existing real-IP and request-logger middleware.
+		r.Use(securityHeaders)
+		r.Use(localAuthTransport(h.cfg)) // inspect the original network peer
+	}
 
 	if h.realIPMiddleware != nil {
 		r.Use(h.realIPMiddleware)
@@ -601,7 +606,9 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 
 	r.Use(middleware.RequestLogger(&zerologRequestLogger{}))
 	r.Use(middleware.Recoverer)
-	r.Use(securityHeaders)
+	if !h.cfg.LocalAuth.Enabled {
+		r.Use(securityHeaders) // preserve the existing disabled-mode stack
+	}
 
 	// TS2021 accepts both the native client's HTTP POST upgrade and the
 	// browser/WASM client's WebSocket GET upgrade; NoiseUpgradeHandler
