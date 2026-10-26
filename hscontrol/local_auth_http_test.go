@@ -330,3 +330,186 @@ func TestLocalAuthEnrollPOSTRejectsDuplicateCSRFCookies(t *testing.T) {
 		})
 	}
 }
+
+func localAuthPendingDevice(app *Headscale) types.AuthID {
+	authID := types.MustAuthID()
+	app.GetState().SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(&types.RegistrationData{Hostname: "laptop"}))
+	return authID
+}
+
+func localAuthRegisterGET(app *Headscale, authID types.AuthID, remote string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "http://login.example.org/register/"+authID.String(), nil)
+	req.RemoteAddr = remote
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	app.HTTPHandler().ServeHTTP(rec, req)
+	return rec
+}
+
+func localAuthLoginPOST(app *Headscale, authID types.AuthID, fields url.Values, cookie *http.Cookie, origin string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "http://login.example.org/register/login/"+authID.String(), strings.NewReader(fields.Encode()))
+	req.RemoteAddr = "10.0.0.5:1234"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	app.HTTPHandler().ServeHTTP(rec, req)
+	return rec
+}
+
+func TestLocalAuthDeviceLoginGETGuardAndLegacy(t *testing.T) {
+	enabled := localAuthHTTPTestApp(t, true)
+	authID := localAuthPendingDevice(enabled)
+	rec := localAuthRegisterGET(enabled, authID, "10.0.0.5:1234")
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+	require.Contains(t, rec.Header().Get("Content-Security-Policy"), "form-action 'self'")
+	require.Contains(t, rec.Body.String(), `type="password"`)
+	require.Contains(t, rec.Body.String(), `name="csrf"`)
+	require.NotContains(t, rec.Body.String(), "headscale auth register")
+	cookies := rec.Result().Cookies()
+	require.Len(t, cookies, 1)
+	require.Equal(t, "__Host-hs-local-login-csrf", cookies[0].Name)
+	require.Equal(t, "/", cookies[0].Path)
+	require.Empty(t, cookies[0].Domain)
+	require.True(t, cookies[0].Secure)
+	require.True(t, cookies[0].HttpOnly)
+	require.Equal(t, http.SameSiteStrictMode, cookies[0].SameSite)
+	require.Contains(t, rec.Body.String(), `name="csrf" value="`+cookies[0].Value+`"`)
+	untrusted := localAuthRegisterGET(enabled, authID, "203.0.113.8:1234")
+	require.Equal(t, http.StatusForbidden, untrusted.Code)
+	require.Empty(t, untrusted.Result().Cookies())
+	missing := localAuthRegisterGET(enabled, types.MustAuthID(), "10.0.0.5:1234")
+	require.Equal(t, http.StatusNotFound, missing.Code)
+	disabled := localAuthHTTPTestApp(t, false)
+	legacy := localAuthRegisterGET(disabled, authID, "10.0.0.5:1234")
+	require.Equal(t, http.StatusOK, legacy.Code)
+	require.Contains(t, legacy.Body.String(), "headscale auth register")
+	require.Empty(t, legacy.Result().Cookies())
+}
+
+func TestLocalAuthDeviceLoginAcceptsCredentialButDoesNotApprove(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user := app.GetState().CreateUserForTest("alice")
+	invitation, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	_, err = app.GetState().RedeemLocalInvitation(invitation, "correct horse battery staple")
+	require.NoError(t, err)
+	authID := localAuthPendingDevice(app)
+	page := localAuthRegisterGET(app, authID, "10.0.0.5:1234")
+	require.Equal(t, http.StatusOK, page.Code)
+	require.Len(t, page.Result().Cookies(), 1)
+	csrfCookie := page.Result().Cookies()[0]
+	untrusted := httptest.NewRequest(http.MethodPost, "http://login.example.org/register/login/"+authID.String(),
+		strings.NewReader(url.Values{"name": {"alice"}, "password": {"correct horse battery staple"}, "csrf": {csrfCookie.Value}}.Encode()))
+	untrusted.RemoteAddr = "203.0.113.8:1234"
+	untrusted.Header.Set("X-Forwarded-Proto", "https")
+	untrusted.Header.Set("Origin", "https://login.example.org")
+	untrusted.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	untrusted.AddCookie(csrfCookie)
+	blocked := httptest.NewRecorder()
+	app.HTTPHandler().ServeHTTP(blocked, untrusted)
+	require.Equal(t, http.StatusForbidden, blocked.Code)
+	require.Empty(t, blocked.Result().Cookies())
+	rec := localAuthLoginPOST(app, authID, url.Values{"name": {"alice"}, "password": {"correct horse battery staple"}, "csrf": {csrfCookie.Value}}, csrfCookie, "https://login.example.org")
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+	require.NotContains(t, rec.Body.String(), "correct horse battery staple")
+	require.NotContains(t, rec.Body.String(), "Device approved")
+	cookies := rec.Result().Cookies()
+	require.Len(t, cookies, 2)
+	require.Equal(t, "__Host-hs-local-login-csrf", cookies[0].Name)
+	require.Equal(t, -1, cookies[0].MaxAge)
+	require.Equal(t, "/", cookies[0].Path)
+	require.Equal(t, "__Host-hs-local-approval", cookies[1].Name)
+	require.Len(t, cookies[1].Value, 43)
+	require.True(t, cookies[1].Secure)
+	require.True(t, cookies[1].HttpOnly)
+	require.Equal(t, "/", cookies[1].Path)
+	require.Empty(t, cookies[1].Domain)
+	require.Equal(t, http.SameSiteStrictMode, cookies[1].SameSite)
+	require.Equal(t, 600, cookies[1].MaxAge)
+}
+
+func TestLocalAuthDeviceLoginRejectsCSRFAndGenericCredentials(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user := app.GetState().CreateUserForTest("alice")
+	invitation, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	_, err = app.GetState().RedeemLocalInvitation(invitation, "correct horse battery staple")
+	require.NoError(t, err)
+	authID := localAuthPendingDevice(app)
+	page := localAuthRegisterGET(app, authID, "10.0.0.5:1234")
+	require.Equal(t, http.StatusOK, page.Code)
+	require.Len(t, page.Result().Cookies(), 1)
+	csrfCookie := page.Result().Cookies()[0]
+	fields := url.Values{"name": {"alice"}, "password": {"correct horse battery staple"}, "csrf": {csrfCookie.Value}}
+	wrongOrigin := localAuthLoginPOST(app, authID, fields, csrfCookie, "https://other.example.org")
+	require.Equal(t, http.StatusForbidden, wrongOrigin.Code)
+	fields.Set("csrf", "wrong")
+	wrongCSRF := localAuthLoginPOST(app, authID, fields, csrfCookie, "https://login.example.org")
+	require.Equal(t, http.StatusForbidden, wrongCSRF.Code)
+	fields.Set("csrf", csrfCookie.Value)
+	fields.Set("password", "wrong password")
+	wrong := localAuthLoginPOST(app, authID, fields, csrfCookie, "https://login.example.org")
+	fields.Set("name", "unknown")
+	fields.Set("password", "correct horse battery staple")
+	unknown := localAuthLoginPOST(app, authID, fields, csrfCookie, "https://login.example.org")
+	require.Equal(t, http.StatusUnauthorized, wrong.Code)
+	require.Equal(t, wrong.Code, unknown.Code)
+	require.Equal(t, "Unable to sign in.\n", wrong.Body.String())
+	require.Equal(t, wrong.Body.String(), unknown.Body.String())
+	require.Empty(t, wrong.Result().Cookies())
+	require.Empty(t, unknown.Result().Cookies())
+	fields.Set("name", "alice")
+	valid := localAuthLoginPOST(app, authID, fields, csrfCookie, "https://login.example.org")
+	require.Equal(t, http.StatusOK, valid.Code)
+}
+
+func TestLocalAuthDeviceLoginRejectsBadInputAndSharedLimit(t *testing.T) {
+	app := localAuthHTTPTestApp(t, true)
+	user := app.GetState().CreateUserForTest("alice")
+	invitation, err := app.GetState().IssueLocalInvitation(types.UserID(user.ID), time.Hour)
+	require.NoError(t, err)
+	_, err = app.GetState().RedeemLocalInvitation(invitation, "correct horse battery staple")
+	require.NoError(t, err)
+	authID := localAuthPendingDevice(app)
+	page := localAuthRegisterGET(app, authID, "10.0.0.5:1234")
+	require.Equal(t, http.StatusOK, page.Code)
+	require.Len(t, page.Result().Cookies(), 1)
+	cookie := page.Result().Cookies()[0]
+	fields := url.Values{"name": {"alice"}, "password": {"correct horse battery staple"}, "csrf": {cookie.Value}}
+	duplicate := &http.Cookie{Name: cookie.Name, Value: "poison"}
+	req := httptest.NewRequest(http.MethodPost, "http://login.example.org/register/login/"+authID.String(), strings.NewReader(fields.Encode()))
+	req.RemoteAddr = "10.0.0.5:1234"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("Origin", "https://login.example.org")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(cookie)
+	req.AddCookie(duplicate)
+	rec := httptest.NewRecorder()
+	app.HTTPHandler().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.Empty(t, rec.Result().Cookies())
+	fields.Add("name", "alice")
+	rec = localAuthLoginPOST(app, authID, fields, cookie, "https://login.example.org")
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	fields.Set("name", "alice")
+	fields.Set("password", strings.Repeat("a", 9000))
+	rec = localAuthLoginPOST(app, authID, fields, cookie, "https://login.example.org")
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	fields.Set("password", "wrong password")
+	for range 5 {
+		rec = localAuthLoginPOST(app, authID, fields, cookie, "https://login.example.org")
+		require.Equal(t, http.StatusUnauthorized, rec.Code)
+		require.Equal(t, "Unable to sign in.\n", rec.Body.String())
+		require.Empty(t, rec.Result().Cookies())
+	}
+	fields.Set("password", "correct horse battery staple")
+	rec = localAuthLoginPOST(app, localAuthPendingDevice(app), fields, cookie, "https://login.example.org")
+	require.Equal(t, http.StatusUnauthorized, rec.Code) // shared login-name limit, even across auth IDs
+	require.Equal(t, "Unable to sign in.\n", rec.Body.String())
+}

@@ -26,6 +26,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/metrics"
 	grpcRuntime "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/juanfont/headscale"
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
 	"github.com/juanfont/headscale/hscontrol/capver"
@@ -109,6 +110,10 @@ type Headscale struct {
 	authProvider   AuthProvider
 	mapBatcher     *mapper.Batcher
 
+	// Short-lived browser logins bind a verified user to an existing pending
+	// AuthID; a separate explicit confirmation is required to register a node.
+	localApprovals *expirable.LRU[string, localApproval]
+
 	clientStreamsOpen sync.WaitGroup
 }
 
@@ -147,6 +152,10 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		noisePrivateKey:   noisePrivateKey,
 		clientStreamsOpen: sync.WaitGroup{},
 		state:             s,
+	}
+
+	if cfg.LocalAuth.Enabled {
+		app.localApprovals = expirable.NewLRU[string, localApproval](1024, nil, 10*time.Minute)
 	}
 
 	if len(cfg.TrustedProxies) > 0 {
@@ -545,12 +554,14 @@ func validateLocalAuthConfig(cfg *types.Config) error {
 }
 
 // localAuthTransport runs before trustedProxyRealIP can replace RemoteAddr.
-// It protects the reserved /local-auth/ path even before enrollment is mounted.
+// It protects the reserved /local-auth/ path and, when local login is enabled,
+// its /register/ page and POST before real-IP rewriting can hide the peer.
 func localAuthTransport(cfg *types.Config) func(http.Handler) http.Handler {
 	origin, _ := url.Parse(cfg.ServerURL) // validated at startup when enabled
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !strings.HasPrefix(r.URL.Path, "/local-auth/") {
+			if !strings.HasPrefix(r.URL.Path, "/local-auth/") &&
+				!(cfg.LocalAuth.Enabled && strings.HasPrefix(r.URL.Path, "/register/")) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -621,7 +632,12 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 	r.Get("/health", h.HealthHandler)
 	r.Get("/version", h.VersionHandler)
 	r.Get("/key", h.KeyHandler)
-	r.Get("/register/{auth_id}", h.authProvider.RegisterHandler)
+	if h.cfg.LocalAuth.Enabled {
+		r.Get("/register/{auth_id}", h.localAuthDeviceLoginPage)
+		r.Post("/register/login/{auth_id}", h.localAuthDeviceLoginPOST)
+	} else {
+		r.Get("/register/{auth_id}", h.authProvider.RegisterHandler)
+	}
 	r.Get("/auth/{auth_id}", h.authProvider.AuthHandler)
 	if h.cfg.LocalAuth.Enabled {
 		r.Get("/local-auth/enroll", h.localAuthEnrollPage)

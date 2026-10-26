@@ -514,6 +514,11 @@ func (s *State) VerifyLocalPassword(name, password string) (bool, error) {
 	return s.db.VerifyLocalPassword(name, password)
 }
 
+// AuthenticateLocalUser returns the credential owner's immutable user ID.
+func (s *State) AuthenticateLocalUser(name, password string) (types.UserID, bool, error) {
+	return s.db.AuthenticateLocalUser(name, password)
+}
+
 // GetUserByID retrieves a user by ID.
 func (s *State) GetUserByID(userID types.UserID) (*types.User, error) {
 	return s.db.GetUserByID(userID)

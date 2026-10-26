@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/types"
 )
 
 const localEnrollCSRFCookie = "__Host-hs-local-enroll-csrf"
@@ -156,4 +157,150 @@ func (h *Headscale) localAuthEnrollPOST(w http.ResponseWriter, r *http.Request) 
 		MaxAge: -1, Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
 	})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+const (
+	localLoginCSRFCookie = "__Host-hs-local-login-csrf"
+	localApprovalCookie  = "__Host-hs-local-approval"
+)
+
+type localApproval struct {
+	AuthID types.AuthID
+	UserID types.UserID
+}
+
+var localLoginPage = template.Must(template.New("local-login").Parse(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Device sign-in</title></head><body>
+<h1>Sign in to review device registration</h1>
+<form method="post" action="/register/login/{{.AuthID}}">
+<label>User name <input name="name" required autocomplete="username"></label>
+<label>Password <input name="password" type="password" required autocomplete="current-password"></label>
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<button type="submit">Sign in</button></form></body></html>`))
+
+// localAuthDeviceLoginPage replaces only the opt-in legacy CLI instructions.
+// It reads the original pending request without consuming or approving it.
+func (h *Headscale) localAuthDeviceLoginPage(w http.ResponseWriter, r *http.Request) {
+	authID, err := authIDFromRequest(r)
+	if err != nil {
+		http.Error(w, "Unable to sign in.", http.StatusBadRequest)
+		return
+	}
+	entry, ok := h.state.GetAuthCacheEntry(authID)
+	if !ok || !entry.IsRegistration() {
+		http.Error(w, "Unable to sign in.", http.StatusNotFound)
+		return
+	}
+	csrf, err := localEnrollRandom()
+	if err != nil {
+		http.Error(w, "Unable to sign in.", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	http.SetCookie(w, &http.Cookie{
+		Name: localLoginCSRFCookie, Value: csrf, Path: "/", MaxAge: 600,
+		Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	})
+	if err := localLoginPage.Execute(w, struct{ AuthID, CSRF string }{authID.String(), csrf}); err != nil {
+		// Static template with validated auth ID and base64url CSRF value.
+		return
+	}
+}
+
+// localAuthDeviceLoginPOST verifies credentials without registering a device.
+// T3c will consume this bounded confirmation state on a separate explicit POST.
+func (h *Headscale) localAuthDeviceLoginPOST(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	fail := func(code int) { http.Error(w, "Unable to sign in.", code) }
+	authID, err := authIDFromRequest(r)
+	if err != nil {
+		fail(http.StatusBadRequest)
+		return
+	}
+	entry, ok := h.state.GetAuthCacheEntry(authID)
+	if !ok || !entry.IsRegistration() {
+		fail(http.StatusNotFound)
+		return
+	}
+	if r.URL.RawQuery != "" || r.URL.ForceQuery {
+		fail(http.StatusBadRequest)
+		return
+	}
+	origin := r.Header.Values("Origin")
+	if len(origin) != 1 || origin[0] != strings.TrimSuffix(h.cfg.ServerURL, "/") {
+		fail(http.StatusForbidden)
+		return
+	}
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/x-www-form-urlencoded" {
+		fail(http.StatusBadRequest)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8*1024)
+	if err := r.ParseForm(); err != nil {
+		fail(http.StatusBadRequest)
+		return
+	}
+	csrf, name, password := r.PostForm["csrf"], r.PostForm["name"], r.PostForm["password"]
+	if len(csrf) != 1 || len(name) != 1 || len(password) != 1 {
+		fail(http.StatusBadRequest)
+		return
+	}
+	cookies := r.CookiesNamed(localLoginCSRFCookie)
+	if len(cookies) != 1 || len(cookies[0].Value) != 43 || len(csrf[0]) != 43 ||
+		subtle.ConstantTimeCompare([]byte(cookies[0].Value), []byte(csrf[0])) != 1 {
+		fail(http.StatusForbidden)
+		return
+	}
+	clientIP, ok := parsePeerAddr(r.RemoteAddr)
+	if !ok {
+		fail(http.StatusServiceUnavailable)
+		return
+	}
+	subject := name[0]
+	if subject == "" || len(subject) > 1024 {
+		subject = "invalid-name"
+	}
+	allowed, err := h.state.AllowLocalAuthAttempt(db.LocalAuthAttemptLogin, clientIP, subject, time.Now())
+	if err != nil {
+		fail(http.StatusServiceUnavailable)
+		return
+	}
+	if !allowed {
+		fail(http.StatusUnauthorized)
+		return
+	}
+	userID, valid, err := h.state.AuthenticateLocalUser(name[0], password[0])
+	if err != nil {
+		fail(http.StatusServiceUnavailable)
+		return
+	}
+	if !valid {
+		fail(http.StatusUnauthorized)
+		return
+	}
+	// A slow password hash may have outlived the pending registration.
+	entry, ok = h.state.GetAuthCacheEntry(authID)
+	if !ok || !entry.IsRegistration() {
+		fail(http.StatusNotFound)
+		return
+	}
+	session, err := localEnrollRandom()
+	if err != nil {
+		fail(http.StatusServiceUnavailable)
+		return
+	}
+	h.localApprovals.Add(session, localApproval{AuthID: authID, UserID: userID})
+	http.SetCookie(w, &http.Cookie{
+		Name: localLoginCSRFCookie, Value: "", Path: "/", MaxAge: -1,
+		Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name: localApprovalCookie, Value: session, Path: "/", MaxAge: 600,
+		Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	})
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte("Sign-in verified. Device approval is not available in this build.\n"))
 }
