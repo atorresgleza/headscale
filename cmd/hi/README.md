@@ -33,6 +33,37 @@ Run `doctor` before the first `run` in any new environment. Tests
 generate ~100 MB of logs per run in `control_logs/`; `doctor` verifies
 there is enough space and that the required Docker images are available.
 
+### Isolated 4ADO T4 checks
+
+For this fork's T4 checks on 4ADO, `cmd/hi/run-isolated-t4.sh` runs only
+`doctor`, `cli` (`TestUserCommand`), or `oidc`
+(`TestOIDCAuthenticationPingAll`) from a clean checkout. It mounts the
+local Docker CLI/socket into a disposable Go container and does not attach
+to the live Headscale or Traefik networks or volumes. It disables hi's
+pre-test cleanup, which otherwise prunes unused Docker networks, and uses
+hi's 900-second timeout and run-ID-scoped post-test cleanup. Do not use
+`hi clean all`, global Docker prune, or production configuration.
+
+Create a fresh directory under the repository's ignored `ignored/` for
+each check, then launch detached so an SSH disconnect does not discard
+the test result:
+
+```bash
+mkdir -p ignored
+run_dir=$(mktemp -d "$PWD/ignored/hi-t4.XXXXXXXX")
+setsid nohup bash cmd/hi/run-isolated-t4.sh doctor "$run_dir" \
+  </dev/null >"$run_dir/launcher.log" 2>&1 &
+printf 'Run directory: %s\n' "$run_dir"
+```
+
+Use `cli` or `oidc` in place of `doctor` only after doctor passes. A
+completed run writes `exit` (numeric code), `revision`, `mode`, `stdout`,
+and `stderr` under that directory; test runs also save hi artefacts in
+`artifacts/<runID>/`. No `exit` file means the result is unknown, not a
+pass. Inspect the run's own logs and containers before any manual scoped
+cleanup. The script never cleans successful test artefacts outside hi's
+own run, and it does not validate production TLS or deployment.
+
 ## Commands
 
 | Command            | Purpose                                              |
