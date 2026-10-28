@@ -70,12 +70,18 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
   >/dev/null 2>&1
 chmod 600 "$STAGING_DIR/certs/key.pem"
 
+if [[ -n $(git -C "$root" status --porcelain) ]]; then
+  echo 'staging requires a clean committed checkout' >&2
+  exit 1
+fi
+expected_revision=$(git -C "$root" rev-parse HEAD)
 docker run --rm -v "$root:/src:ro" -v "$STAGING_DIR/bin:/out" \
   -v headscale-local-auth-gomodcache:/go/pkg/mod \
   -v headscale-local-auth-gocache:/root/.cache/go-build \
   -w /src -e GOTOOLCHAIN=local -e GIT_CONFIG_COUNT=1 \
   -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/src \
-  golang:1.26.5-trixie go build -o /out/headscale ./cmd/headscale
+  golang:1.26.5-trixie go build -buildvcs=true -o /out/headscale ./cmd/headscale
+docker run --rm -v "$STAGING_DIR/bin:/out:ro" golang:1.26.5-trixie go version -m /out/headscale | python3 -c   'import sys; lines=sys.stdin.read().splitlines(); assert "\tbuild\tvcs.revision="+sys.argv[1] in lines and "\tbuild\tvcs.modified=false" in lines, "staging binary has no clean expected VCS stamp"'   "$expected_revision"
 docker run --rm -v "$STAGING_DIR/config.yaml:/staging/config.yaml:ro" \
   -v "$STAGING_DIR/bin:/staging/bin:ro" \
   -v "$STAGING_DIR/derp.yaml:/staging/derp.yaml:ro" golang:1.26.5-trixie \
@@ -122,7 +128,7 @@ spoofed=$(docker run --rm --network "$network" curlimages/curl:8.11.1 \
 [[ "$spoofed" == 200 ]] || { echo "spoofed XFP was not overwritten: $spoofed" >&2; exit 1; }
 direct=$(docker run --rm --network "$network" curlimages/curl:8.11.1 \
   --silent --max-time 5 -o /dev/null -w '%{http_code}' \
-  -H "Host: $host:18443" -H 'X-Forwarded-Proto: https' \
+  -H "Host: $host" -H 'X-Forwarded-Proto: https' \
   http://headscale:8080/local-auth/enroll)
 [[ "$direct" == 403 ]] || { echo "untrusted direct backend was not rejected: $direct" >&2; exit 1; }
 
