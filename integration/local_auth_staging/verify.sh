@@ -15,7 +15,17 @@ if docker ps -aq --filter "label=com.docker.compose.project=$project" | grep -q 
   exit 1
 fi
 export STAGING_DIR
-STAGING_DIR=$(mktemp -d "$root/.local-auth-t4.XXXXXXXX")
+if [[ -n $(git -C "$root" status --porcelain) ]]; then
+  echo 'staging requires a clean committed checkout' >&2
+  exit 1
+fi
+expected_revision=$(git -C "$root" rev-parse HEAD)
+created_ignored_dir=0
+if [[ ! -d "$root/ignored" ]]; then
+  mkdir -p "$root/ignored"
+  created_ignored_dir=1
+fi
+STAGING_DIR=$(mktemp -d "$root/ignored/.local-auth-t4.XXXXXXXX")
 started=0
 cleanup() {
   status=$?
@@ -29,6 +39,9 @@ cleanup() {
     docker compose -p "$project" -f "$compose" down --remove-orphans || true
   fi
   rm -rf -- "$STAGING_DIR"
+  if (( created_ignored_dir )); then
+    rmdir -- "$root/ignored" 2>/dev/null || true
+  fi
   exit "$status"
 }
 trap cleanup EXIT
@@ -70,11 +83,6 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
   >/dev/null 2>&1
 chmod 600 "$STAGING_DIR/certs/key.pem"
 
-if [[ -n $(git -C "$root" status --porcelain) ]]; then
-  echo 'staging requires a clean committed checkout' >&2
-  exit 1
-fi
-expected_revision=$(git -C "$root" rev-parse HEAD)
 docker run --rm -v "$root:/src:ro" -v "$STAGING_DIR/bin:/out" \
   -v headscale-local-auth-gomodcache:/go/pkg/mod \
   -v headscale-local-auth-gocache:/root/.cache/go-build \
