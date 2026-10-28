@@ -1,0 +1,26 @@
+# Real Traefik in a disposable private network; self-signed staging TLS only.
+http:
+  routers:
+    headscale:
+      rule: Host(`stage.headscale.test`)
+      entryPoints:
+        - websecure
+      middlewares:
+        - overwrite-transport
+      service: headscale
+      tls: {}
+  middlewares:
+    overwrite-transport:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-Proto: https
+  services:
+    headscale:
+      loadBalancer:
+        servers:
+          - url: http://headscale:8080
+
+tls:
+  certificates:
+    - certFile: /certs/cert.pem
+      keyFile: /certs/key.pem

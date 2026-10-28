@@ -1,0 +1,37 @@
+# Disposable verification only. Never attach these services to the live traefik network.
+services:
+  headscale:
+    image: golang:1.26.5-trixie
+    command: ["/staging/bin/headscale", "--config", "/staging/config.yaml", "serve"]
+    volumes:
+      - "${STAGING_DIR}/bin:/staging/bin:ro"
+      - "${STAGING_DIR}/config.yaml:/staging/config.yaml:ro"
+      - "${STAGING_DIR}/derp.yaml:/staging/derp.yaml:ro"
+      - "${STAGING_DIR}/data:/var/lib/headscale"
+    networks:
+      isolated:
+        ipv4_address: 172.30.88.2
+
+  traefik:
+    image: traefik:v3.6.10
+    command:
+      - "--entrypoints.websecure.address=:443"
+      - "--providers.file.filename=/staging/traefik.yaml"
+      - "--providers.file.watch=false"
+      - "--accesslog=true"
+    volumes:
+      - "./traefik.yaml:/staging/traefik.yaml:ro"
+      - "${STAGING_DIR}/certs:/certs:ro"
+    networks:
+      isolated:
+        ipv4_address: 172.30.88.3
+    depends_on:
+      - headscale
+
+networks:
+  isolated:
+    name: headscale-t4-isolated
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.88.0/24
