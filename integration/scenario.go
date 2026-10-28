@@ -185,10 +185,11 @@ func NewScenario(spec ScenarioSpec) (*Scenario, error) {
 		return nil, fmt.Errorf("connecting to docker: %w", err)
 	}
 
-	// Opportunity to clean up unreferenced networks.
-	// This might be a no op, but it is worth a try as we sometime
-	// dont clean up nicely after ourselves.
-	_ = dockertestutil.CleanUnreferencedNetworks(pool)
+	// T4's isolated runner must not remove networks owned by other runs.
+	// Keep the existing cleanup behavior for all ordinary integration runs.
+	if os.Getenv("HEADSCALE_INTEGRATION_T4_ISOLATED") != "1" {
+		_ = dockertestutil.CleanUnreferencedNetworks(pool)
+	}
 	_ = dockertestutil.CleanImagesInCI(pool)
 
 	if spec.MaxWait == 0 {

@@ -13,8 +13,16 @@ if [[ -L "$root/ignored" || $(dirname "$run_dir") != "$root/ignored" || $(basena
   echo 'run directory must be a real directory under ignored/hi-t4.*' >&2
   exit 2
 fi
-if [[ -e "$run_dir/exit" ]]; then
-  echo 'run directory already has a result' >&2
+for entry in "$run_dir"/* "$run_dir"/.[!.]* "$run_dir"/..?*; do
+  if [[ -e "$entry" || -L "$entry" ]]; then
+    if [[ "$entry" != "$run_dir/launcher.log" || -L "$entry" || ! -f "$entry" ]]; then
+      echo 'run directory must be fresh (only a regular launcher.log is allowed)' >&2
+      exit 2
+    fi
+  fi
+done
+if ! ( set -C; : > "$run_dir/started" ); then
+  echo 'run directory already started' >&2
   exit 2
 fi
 if [[ -n $(git -C "$root" status --porcelain) ]]; then
@@ -31,6 +39,7 @@ finish() {
 trap finish EXIT
 printf '%s\n' "$(git -C "$root" rev-parse HEAD)" > "$run_dir/revision"
 printf '%s\n' "$mode" > "$run_dir/mode"
+mkdir -p "$run_dir/go" "$run_dir/go-build"
 
 args=(doctor)
 if [[ "$mode" != doctor ]]; then
@@ -42,9 +51,14 @@ fi
 docker run --rm --pull=never --name "hs-t4-hi-${mode}-$(basename "$run_dir")" \
   --network bridge \
   --mount "type=bind,src=$root,dst=$root" \
+  --mount "type=bind,src=$run_dir/go,dst=/go" \
+  --mount "type=bind,src=$run_dir/go-build,dst=/root/.cache/go-build" \
   --mount type=bind,src=/usr/bin/docker,dst=/usr/bin/docker,readonly \
   --mount type=bind,src=/run/docker.sock,dst=/var/run/docker.sock \
   --workdir "$root" \
+  --env HEADSCALE_INTEGRATION_T4_ISOLATED=1 \
+  --env "HEADSCALE_INTEGRATION_GO_CACHE=$run_dir/go" \
+  --env "HEADSCALE_INTEGRATION_GO_BUILD_CACHE=$run_dir/go-build" \
   --env GIT_CONFIG_COUNT=1 \
   --env GIT_CONFIG_KEY_0=safe.directory \
   --env "GIT_CONFIG_VALUE_0=$root" \

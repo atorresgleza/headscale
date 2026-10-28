@@ -40,9 +40,12 @@ For this fork's T4 checks on 4ADO, `cmd/hi/run-isolated-t4.sh` runs only
 (`TestOIDCAuthenticationPingAll`) from a clean checkout. It mounts the
 local Docker CLI/socket into a disposable Go container and does not attach
 to the live Headscale or Traefik networks or volumes. It disables hi's
-pre-test cleanup, which otherwise prunes unused Docker networks, and uses
-hi's 900-second timeout and run-ID-scoped post-test cleanup. Do not use
-`hi clean all`, global Docker prune, or production configuration.
+pre-test cleanup and opts out of the otherwise global `hs-*` network sweep
+in `NewScenario` for these runs only; normal integration runs are unchanged.
+Its Go module/build caches are bound to the run's own directory rather than
+shared Docker cache volumes. It uses hi's 900-second timeout and run-ID-scoped
+post-test cleanup. Do not use `hi clean all`, global Docker prune, or
+production configuration.
 
 Create a fresh directory under the repository's ignored `ignored/` for
 each check, then launch detached so an SSH disconnect does not discard
@@ -59,10 +62,13 @@ printf 'Run directory: %s\n' "$run_dir"
 Use `cli` or `oidc` in place of `doctor` only after doctor passes. A
 completed run writes `exit` (numeric code), `revision`, `mode`, `stdout`,
 and `stderr` under that directory; test runs also save hi artefacts in
-`artifacts/<runID>/`. No `exit` file means the result is unknown, not a
-pass. Inspect the run's own logs and containers before any manual scoped
-cleanup. The script never cleans successful test artefacts outside hi's
-own run, and it does not validate production TLS or deployment.
+`artifacts/<runID>/`. The wrapper rejects a reused directory: only the
+regular `launcher.log` created by the launch redirection may pre-exist, and
+it creates a `started` marker before any test. No `exit` file means the result
+is unknown, not a pass; create a new directory for another attempt. Inspect
+the run's own logs and containers before any manual scoped cleanup. The
+script never cleans successful test artefacts outside hi's own run, and it
+does not validate production TLS or deployment.
 
 ## Commands
 
