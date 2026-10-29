@@ -18,6 +18,10 @@ LICENSE
 
 *.sock
 
+# Local test outputs and Go caches are not build inputs.
+ignored/
+control_logs/
+
 node_modules/
 package-lock.json
 package.json
