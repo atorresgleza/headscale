@@ -185,6 +185,29 @@ func NewScenario(spec ScenarioSpec) (*Scenario, error) {
 		return nil, fmt.Errorf("connecting to docker: %w", err)
 	}
 
+	// The isolated runner uses a local socket. Without an explicit API version,
+	// dockertest builds with the Dockerfile option at API v1.25, which newer
+	// daemons can reject before the tar upload finishes.
+	if os.Getenv("HEADSCALE_INTEGRATION_T4_ISOLATED") == "1" {
+		endpoint := pool.Client.Endpoint()
+		if !strings.HasPrefix(endpoint, "unix://") {
+			return nil, fmt.Errorf("isolated integration requires a local Docker Unix socket")
+		}
+
+		version, err := pool.Client.Version()
+		if err != nil {
+			return nil, fmt.Errorf("reading Docker API version: %w", err)
+		}
+		apiVersion := version.Get("ApiVersion")
+		if _, err := docker.NewAPIVersion(apiVersion); err != nil {
+			return nil, fmt.Errorf("invalid Docker API version %q: %w", apiVersion, err)
+		}
+		pool.Client, err = docker.NewVersionedClient(endpoint, apiVersion)
+		if err != nil {
+			return nil, fmt.Errorf("connecting to Docker API %s: %w", apiVersion, err)
+		}
+	}
+
 	// T4's isolated runner must not remove networks owned by other runs.
 	// Keep the existing cleanup behavior for all ordinary integration runs.
 	if os.Getenv("HEADSCALE_INTEGRATION_T4_ISOLATED") != "1" {

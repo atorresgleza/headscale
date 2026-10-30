@@ -42,8 +42,12 @@ local Docker CLI/socket into a disposable Go container and does not attach
 to the live Headscale or Traefik networks or volumes. It disables hi's
 pre-test cleanup and opts out of the otherwise global `hs-*` network sweep
 in `NewScenario` for these runs only; normal integration runs are unchanged.
-Its Go module/build caches are bound to the run's own directory rather than
-shared Docker cache volumes. It uses hi's 900-second timeout and run-ID-scoped
+For these isolated runs, `NewScenario` also reads the local Docker daemon's API
+version and uses it explicitly: dockertest otherwise sends builds as API v1.25,
+which newer daemons can reject before reporting an HTTP error. A non-Unix Docker
+endpoint or an invalid version fails closed; normal integration runs retain
+their previous client behavior. Its Go module/build caches are bound to the
+run's own directory rather than shared Docker cache volumes. It uses hi's 900-second timeout and run-ID-scoped
 post-test cleanup. Do not use `hi clean all`, global Docker prune, or
 production configuration.
 
