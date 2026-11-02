@@ -101,6 +101,7 @@ for old, new in {
     '\n  auto_update_enabled: true\n': '\n  auto_update_enabled: false\n',
     '\n  paths: []\n': '\n  paths:\n    - /staging/derp.yaml\n',
     '\ndisable_check_updates: false\n': '\ndisable_check_updates: true\n',
+    '\nunix_socket: /var/run/headscale/headscale.sock\n': '\nunix_socket: /var/lib/headscale/headscale.sock\n',
     '\n  mode: file\n': '\n  mode: database\n',
 }.items():
     assert config.count(old) == 1, 'config example changed'
