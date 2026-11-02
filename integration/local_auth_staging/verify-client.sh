@@ -6,8 +6,6 @@ umask 077
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 run_dir=${1:?usage: verify-client.sh FRESH_IGNORED_RUN_DIR}
-compose="$root/integration/local_auth_staging/compose.yaml"
-override="$root/integration/local_auth_staging/client.override.yaml"
 project=headscale-local-auth-t4
 network=headscale-t4-isolated
 host=hs.aaaagen.com
@@ -74,12 +72,19 @@ finish() {
 }
 trap finish EXIT
 trap 'exit 130' INT TERM
+git clone --quiet --no-hardlinks --no-checkout -- "$root" "$STAGING_DIR/source"
+git -C "$STAGING_DIR/source" -c advice.detachedHead=false checkout --quiet --detach "$(<"$run_dir/revision")"
+[[ $(git -C "$STAGING_DIR/source" rev-parse HEAD) == "$(<"$run_dir/revision")" &&
+   -z $(git -C "$STAGING_DIR/source" status --porcelain) ]] || { echo 'staging source snapshot mismatch' >&2; exit 2; }
+source_root="$STAGING_DIR/source"
+compose="$source_root/integration/local_auth_staging/compose.yaml"
+override="$source_root/integration/local_auth_staging/client.override.yaml"
 mkdir -p "$STAGING_DIR"/{bin,certs,data,secret,ca-private,cache/mod,cache/build}
 STAGING_UID=$(id -u)
 STAGING_GID=$(id -g)
 export STAGING_UID STAGING_GID
 
-python3 - "$root/config-example.yaml" "$STAGING_DIR/config.yaml" "$root/derp-example.yaml" "$STAGING_DIR/derp.yaml" "$root/integration/local_auth_staging/traefik.yaml" "$STAGING_DIR/traefik.yaml" <<'PY'
+python3 - "$source_root/config-example.yaml" "$STAGING_DIR/config.yaml" "$source_root/derp-example.yaml" "$STAGING_DIR/derp.yaml" "$source_root/integration/local_auth_staging/traefik.yaml" "$STAGING_DIR/traefik.yaml" <<'PY'
 from pathlib import Path
 import sys
 config = Path(sys.argv[1]).read_text()
@@ -121,7 +126,7 @@ docker run --rm --network none --read-only -u "$(id -u):$(id -g)" \
   -v headscale-local-auth-gomodcache:/source:ro -v "$STAGING_DIR/cache/mod:/dest" \
   --entrypoint /bin/sh golang:1.26.5-trixie \
   -c 'cp -R /source/. /dest/ && chmod -R u+w /dest/cache/download'
-docker run --rm --network none -u "$(id -u):$(id -g)" -v "$root:/src:ro" \
+docker run --rm --network none -u "$(id -u):$(id -g)" -v "$source_root:/src:ro" \
   -v "$STAGING_DIR/bin:/out" -v "$STAGING_DIR/cache/mod:/cache/mod" \
   -v "$STAGING_DIR/cache/build:/cache/build" -w /src \
   -e GOMODCACHE=/cache/mod -e GOCACHE=/cache/build -e GOPROXY=off -e GOSUMDB=off -e GOTOOLCHAIN=local \
@@ -142,7 +147,7 @@ done
 
 flow_id=$(docker run -d --name "$flow" --network "$network" --user "$(id -u):$(id -g)" \
   -v "$STAGING_DIR/secret:/staging/secret" -v "$STAGING_DIR/certs/ca.pem:/staging/certs/ca.pem:ro" \
-  -v "$root/integration/local_auth_staging/client-flow.cjs:/staging/client-flow.cjs:ro" \
+  -v "$source_root/integration/local_auth_staging/client-flow.cjs:/staging/client-flow.cjs:ro" \
   -e NODE_EXTRA_CA_CERTS=/staging/certs/ca.pem --entrypoint /bin/sh \
   mcr.microsoft.com/playwright:v1.58.0-noble -c 'sleep 600')
 for attempt in $(seq 1 30); do
