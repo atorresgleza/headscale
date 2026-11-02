@@ -5,7 +5,11 @@ umask 077
 
 root=$(git rev-parse --show-toplevel)
 cd "$root"
-run_dir=${1:?usage: verify-client.sh FRESH_IGNORED_RUN_DIR}
+run_dir=${1:?usage: verify-client.sh FRESH_IGNORED_RUN_DIR [--invitation-shape-only]}
+if [[ $# -gt 2 || ( -n "${2-}" && "${2-}" != --invitation-shape-only ) ]]; then
+  echo 'usage: verify-client.sh FRESH_IGNORED_RUN_DIR [--invitation-shape-only]' >&2; exit 2
+fi
+mode=${2-}
 project=headscale-local-auth-t4
 network=headscale-t4-isolated
 host=hs.aaaagen.com
@@ -156,6 +160,55 @@ for service in traefik headscale; do
     python3 -c 'import json,sys; a,b=sys.stdin.read().strip().split(" ",1); assert not json.loads(a) and not any((json.loads(b) or {}).values()), "published host port"'
 done
 [[ $(docker network inspect "$network" --format '{{.Internal}}') == true ]] || { echo 'staging network not internal' >&2; exit 1; }
+
+if [[ "$mode" == --invitation-shape-only ]]; then
+  # Probe CLI output shape without starting the browser-flow or Tailscale client.
+  docker compose -p "$project" -f "$compose" -f "$override" exec -T headscale /staging/bin/headscale --config /staging/config.yaml users create staging-test-user >"$STAGING_DIR/secret/user.out" 2>"$STAGING_DIR/secret/user.err"
+  docker compose -p "$project" -f "$compose" -f "$override" exec -T headscale /staging/bin/headscale --config /staging/config.yaml users list -o json >"$STAGING_DIR/secret/users.json" 2>"$STAGING_DIR/secret/users.err"
+  user_id=$(python3 - "$STAGING_DIR/secret/users.json" <<'PY'
+import json,sys
+users=json.load(open(sys.argv[1])); assert len(users)==1 and users[0]['name']=='staging-test-user'
+print(users[0]['id'])
+PY
+)
+  docker compose -p "$project" -f "$compose" -f "$override" exec -T headscale /staging/bin/headscale --config /staging/config.yaml users invite --identifier "$user_id" --origin "https://$host" -o json >"$STAGING_DIR/secret/invitation" 2>"$STAGING_DIR/secret/invite.err"
+  python3 - "$STAGING_DIR/secret/invitation" "$run_dir/invitation-shape.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+with open(sys.argv[1], 'rb') as stream:
+    raw = stream.read(16385)
+oversized = len(raw) > 16384
+kind = 'invalid'
+valid = False
+sole_url_string = False
+if not oversized:
+    try:
+        def reject_constant(_):
+            raise ValueError
+        document = json.loads(raw.decode('utf-8'), parse_constant=reject_constant)
+        valid = True
+        kind = ('object' if type(document) is dict else
+                'array' if type(document) is list else 'scalar')
+        sole_url_string = (type(document) is dict and list(document) == ['url']
+                           and type(document['url']) is str)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        pass
+shape = {
+    'json_valid': valid,
+    'line_count_capped': min(len(raw.splitlines()), 100),
+    'kind': kind,
+    'sole_url_string': sole_url_string,
+    'input_over_limit': oversized,
+}
+Path(sys.argv[2]).write_text(json.dumps(shape, sort_keys=True) + '\n')
+if not sole_url_string:
+    sys.exit(1)
+PY
+  printf 'PASS private invitation JSON shape; no browser or Tailscale client started\n'
+  exit 0
+fi
 
 flow_id=$(docker run -d --name "$flow" --network "$network" --user "$(id -u):$(id -g)" \
   -v "$STAGING_DIR/secret:/staging/secret" -v "$STAGING_DIR/certs/ca.pem:/staging/certs/ca.pem:ro" \
