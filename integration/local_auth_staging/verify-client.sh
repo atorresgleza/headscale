@@ -178,7 +178,7 @@ users=json.load(open(sys.argv[1])); assert len(users)==1 and users[0]['name']=='
 print(users[0]['id'])
 PY
 )
-docker compose -p "$project" -f "$compose" -f "$override" exec -T headscale /staging/bin/headscale --config /staging/config.yaml users invite --identifier "$user_id" --origin "https://$host" >"$STAGING_DIR/secret/invitation" 2>"$STAGING_DIR/secret/invite.err"
+docker compose -p "$project" -f "$compose" -f "$override" exec -T headscale /staging/bin/headscale --config /staging/config.yaml users invite --identifier "$user_id" --origin "https://$host" -o json >"$STAGING_DIR/secret/invitation" 2>"$STAGING_DIR/secret/invite.err"
 printf 'isolated-staging-password-only-2026\n' >"$STAGING_DIR/secret/password"
 docker exec "$flow" node /staging/client-flow.cjs enroll
 printf 'PASS staging-only user credential enrolled without exporting invitation\n'

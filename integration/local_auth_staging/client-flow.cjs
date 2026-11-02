@@ -49,9 +49,13 @@ async function preflight() {
   console.log('PASS internal DNS alias and test CA HTTPS validation');
 }
 async function enroll() {
-  const link = fs.readFileSync(path.join(secret, 'invitation'), 'utf8').trim();
+  const raw = fs.readFileSync(path.join(secret, 'invitation'), 'utf8');
   enrollStage = 'link-parse';
-  const url = new URL(link);
+  const invitation = JSON.parse(raw);
+  assert.ok(invitation && typeof invitation === 'object' && !Array.isArray(invitation));
+  assert.deepEqual(Object.keys(invitation), ['url']);
+  assert.equal(typeof invitation.url, 'string');
+  const url = new URL(invitation.url);
   enrollStage = 'link-validate';
   assert.equal(url.origin, base);
   assert.equal(url.pathname, '/local-auth/enroll');
