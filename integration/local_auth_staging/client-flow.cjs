@@ -8,6 +8,8 @@ const path = require('node:path');
 const host = 'hs.aaaagen.com';
 const secret = '/staging/secret';
 const base = `https://${host}`;
+let enrollStage = 'link';
+let enrollStatus = 'none';
 
 function hidden(html) {
   const match = html.match(/name="csrf" value="([A-Za-z0-9_-]{43})"/);
@@ -52,9 +54,17 @@ async function enroll() {
   assert.equal(url.origin, base);
   assert.equal(url.pathname, '/local-auth/enroll');
   assert.match(url.hash, /^#[A-Za-z0-9_-]{43}$/);
+  enrollStage = 'page';
   const page = await request(url.pathname);
+  enrollStatus = Number.isInteger(page.status) && page.status >= 100 && page.status <= 599 ? page.status : 'none';
   assert.equal(page.status, 200);
-  const result = await request('/local-auth/enroll', 'POST', form({csrf: hidden(page.body), password: fs.readFileSync(path.join(secret, 'password'), 'utf8').trim(), token: url.hash.slice(1)}), cookie(page.headers, '__Host-hs-local-enroll-csrf'));
+  enrollStage = 'form';
+  const csrf = hidden(page.body);
+  const enrollCookie = cookie(page.headers, '__Host-hs-local-enroll-csrf');
+  enrollStage = 'submit';
+  enrollStatus = 'none';
+  const result = await request('/local-auth/enroll', 'POST', form({csrf, password: fs.readFileSync(path.join(secret, 'password'), 'utf8').trim(), token: url.hash.slice(1)}), enrollCookie);
+  enrollStatus = Number.isInteger(result.status) && result.status >= 100 && result.status <= 599 ? result.status : 'none';
   assert.equal(result.status, 204, 'enrollment must consume the invitation');
   console.log('PASS staging invitation redeemed over CA-verified HTTPS');
 }
@@ -94,8 +104,14 @@ async function approve() {
   else if (action === 'login') await login();
   else if (action === 'approve') await approve();
   else throw new Error('usage: client-flow.cjs preflight|enroll|login|approve');
-})().catch(() => {
-  // Assertion errors can quote input, including the invitation fragment.
-  console.error('staging flow failed; inspect only sanitized status evidence');
+})().catch(error => {
+  // Never print the exception: assertion messages can contain bearer fragments.
+  if (process.argv[2] === 'enroll') {
+    const category = error instanceof assert.AssertionError ? 'assertion' :
+      error instanceof Error && Object.prototype.hasOwnProperty.call(error, 'code') ? 'transport' : 'other';
+    console.error(`staging flow failed stage=${enrollStage} status=${enrollStatus} category=${category}`);
+  } else {
+    console.error('staging flow failed; inspect only sanitized status evidence');
+  }
   process.exitCode = 1;
 });
