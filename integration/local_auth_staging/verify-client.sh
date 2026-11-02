@@ -32,6 +32,13 @@ for image in golang:1.26.5-trixie traefik:v3.6.10 mcr.microsoft.com/playwright:v
   docker image inspect "$image" >/dev/null || { echo 'required cached image missing' >&2; exit 2; }
 done
 docker volume inspect headscale-local-auth-gomodcache >/dev/null || { echo 'staging-only module cache unavailable' >&2; exit 2; }
+module_kib=$(docker run --rm --network none --read-only \
+  -v headscale-local-auth-gomodcache:/source:ro --entrypoint /bin/sh \
+  golang:1.26.5-trixie -c 'du -sk /source | cut -f1')
+free_kib=$(df -Pk "$root" | awk 'NR==2 {print $4}')
+[[ "$module_kib" =~ ^[0-9]+$ && "$module_kib" -le 1572864 && "$free_kib" -ge $((module_kib * 2 + 2097152)) ]] || {
+  echo 'insufficient bounded space for private writable Go module cache' >&2; exit 2;
+}
 
 STAGING_DIR=$(mktemp -d "$root/ignored/.local-auth-device.XXXXXXXX")
 export STAGING_DIR
@@ -67,7 +74,7 @@ finish() {
 }
 trap finish EXIT
 trap 'exit 130' INT TERM
-mkdir -p "$STAGING_DIR"/{bin,certs,data,secret,ca-private,cache/build}
+mkdir -p "$STAGING_DIR"/{bin,certs,data,secret,ca-private,cache/mod,cache/build}
 STAGING_UID=$(id -u)
 STAGING_GID=$(id -g)
 export STAGING_UID STAGING_GID
@@ -110,13 +117,18 @@ openssl x509 -req -in "$STAGING_DIR/certs/leaf.csr" -CA "$STAGING_DIR/certs/ca.p
 
 docker compose -p "$project" -f "$compose" -f "$override" config --format json |
   python3 -c 'import json,sys; c=json.load(sys.stdin); n=c["networks"]["isolated"]; p=c["services"]["traefik"]; assert n["internal"] is True and "hs.aaaagen.com" in p["networks"]["isolated"]["aliases"] and not p.get("ports"); assert not c["services"]["headscale"].get("ports")'
+docker run --rm --network none --read-only -u "$(id -u):$(id -g)" \
+  -v headscale-local-auth-gomodcache:/source:ro -v "$STAGING_DIR/cache/mod:/dest" \
+  --entrypoint /bin/sh golang:1.26.5-trixie \
+  -c 'cp -R /source/. /dest/ && chmod -R u+w /dest/cache/download'
 docker run --rm --network none -u "$(id -u):$(id -g)" -v "$root:/src:ro" \
-  -v "$STAGING_DIR/bin:/out" -v headscale-local-auth-gomodcache:/cache/mod:ro \
+  -v "$STAGING_DIR/bin:/out" -v "$STAGING_DIR/cache/mod:/cache/mod" \
   -v "$STAGING_DIR/cache/build:/cache/build" -w /src \
   -e GOMODCACHE=/cache/mod -e GOCACHE=/cache/build -e GOPROXY=off -e GOSUMDB=off -e GOTOOLCHAIN=local \
   -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/src \
   golang:1.26.5-trixie go build -buildvcs=true -o /out/headscale ./cmd/headscale
-[[ $(docker run --rm --network none -v "$STAGING_DIR/bin:/out:ro" golang:1.26.5-trixie go version -m /out/headscale | grep -F $'\tbuild\tvcs.revision=' | cut -f3) == "$(cat "$run_dir/revision")" ]] || { echo 'staging binary revision mismatch' >&2; exit 1; }
+docker run --rm --network none -v "$STAGING_DIR/bin:/out:ro" golang:1.26.5-trixie go version -m /out/headscale |
+  python3 -c 'import sys; lines=sys.stdin.read().splitlines(); expected=sys.argv[1]; assert "\tbuild\tvcs.revision="+expected in lines and "\tbuild\tvcs.modified=false" in lines, "staging binary revision mismatch"' "$(git rev-parse HEAD)"
 docker run --rm --network none -v "$STAGING_DIR/config.yaml:/staging/config.yaml:ro" -v "$STAGING_DIR/bin:/staging/bin:ro" -v "$STAGING_DIR/derp.yaml:/staging/derp.yaml:ro" golang:1.26.5-trixie /staging/bin/headscale --config /staging/config.yaml configtest >/dev/null
 started=1
 docker compose -p "$project" -f "$compose" -f "$override" up -d >/dev/null
