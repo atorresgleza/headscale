@@ -63,8 +63,13 @@ finish() {
   for name in "$client" "$flow"; do
     if docker inspect "$name" >/dev/null 2>&1; then cleanup_exit=1; fi
   done
-  rm -rf -- "$STAGING_DIR"
-  [[ $? == 0 ]] || cleanup_exit=1
+  if [[ -d "$STAGING_DIR/cache/mod" && ! -L "$STAGING_DIR/cache/mod" ]]; then
+    chmod -R u+w -- "$STAGING_DIR/cache/mod" >>"$run_dir/cleanup.log" 2>&1 || cleanup_exit=1
+  elif [[ -e "$STAGING_DIR/cache/mod" ]]; then
+    cleanup_exit=1
+  fi
+  rm -rf -- "$STAGING_DIR" >>"$run_dir/cleanup.log" 2>&1
+  [[ $? == 0 && ! -e "$STAGING_DIR" ]] || cleanup_exit=1
   printf '%s\n' "$cleanup_exit" > "$run_dir/cleanup.exit"
   (( cleanup_exit == 0 )) || result=1
   printf '%s\n' "$result" > "$run_dir/exit"
@@ -139,7 +144,13 @@ started=1
 docker compose -p "$project" -f "$compose" -f "$override" up -d >/dev/null
 for service in traefik headscale; do
   id=$(docker compose -p "$project" -f "$compose" -f "$override" ps -q "$service")
-  [[ -n "$id" ]] || { echo 'staging service unavailable' >&2; exit 1; }
+  if [[ -z "$id" ]]; then
+    {
+      docker compose -p "$project" -f "$compose" -f "$override" ps --all || true
+      docker compose -p "$project" -f "$compose" -f "$override" logs --no-color --tail=80 "$service" || true
+    } >"$run_dir/startup-diagnostic.log" 2>&1
+    echo 'staging service unavailable (private startup diagnostic retained)' >&2; exit 1
+  fi
   docker inspect "$id" --format '{{json .HostConfig.PortBindings}} {{json .NetworkSettings.Ports}}' |
     python3 -c 'import json,sys; a,b=sys.stdin.read().strip().split(" ",1); assert not json.loads(a) and not any((json.loads(b) or {}).values()), "published host port"'
 done
