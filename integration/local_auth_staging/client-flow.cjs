@@ -8,7 +8,7 @@ const path = require('node:path');
 const host = 'hs.aaaagen.com';
 const secret = '/staging/secret';
 const base = `https://${host}`;
-let enrollStage = 'link';
+let enrollStage = 'link-read';
 let enrollStatus = 'none';
 
 function hidden(html) {
@@ -50,7 +50,9 @@ async function preflight() {
 }
 async function enroll() {
   const link = fs.readFileSync(path.join(secret, 'invitation'), 'utf8').trim();
+  enrollStage = 'link-parse';
   const url = new URL(link);
+  enrollStage = 'link-validate';
   assert.equal(url.origin, base);
   assert.equal(url.pathname, '/local-auth/enroll');
   assert.match(url.hash, /^#[A-Za-z0-9_-]{43}$/);
@@ -107,8 +109,14 @@ async function approve() {
 })().catch(error => {
   // Never print the exception: assertion messages can contain bearer fragments.
   if (process.argv[2] === 'enroll') {
-    const category = error instanceof assert.AssertionError ? 'assertion' :
-      error instanceof Error && Object.prototype.hasOwnProperty.call(error, 'code') ? 'transport' : 'other';
+    const code = error instanceof Error && Object.prototype.hasOwnProperty.call(error, 'code') ? error.code : null;
+    let category = 'other';
+    if (error instanceof assert.AssertionError) category = 'assertion';
+    else if (enrollStage === 'link-read' && code === 'ENOENT') category = 'file-missing';
+    else if (enrollStage === 'link-read' && (code === 'EACCES' || code === 'EPERM')) category = 'file-denied';
+    else if (enrollStage === 'link-parse' && code === 'ERR_INVALID_URL') category = 'invalid-url';
+    else if (['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH'].includes(code) &&
+      (enrollStage === 'page' || enrollStage === 'submit')) category = 'transport';
     console.error(`staging flow failed stage=${enrollStage} status=${enrollStatus} category=${category}`);
   } else {
     console.error('staging flow failed; inspect only sanitized status evidence');
