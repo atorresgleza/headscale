@@ -128,7 +128,7 @@ docker run --rm --network none -u "$(id -u):$(id -g)" -v "$root:/src:ro" \
   -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/src \
   golang:1.26.5-trixie go build -buildvcs=true -o /out/headscale ./cmd/headscale
 docker run --rm --network none -v "$STAGING_DIR/bin:/out:ro" golang:1.26.5-trixie go version -m /out/headscale |
-  python3 -c 'import sys; lines=sys.stdin.read().splitlines(); expected=sys.argv[1]; assert "\tbuild\tvcs.revision="+expected in lines and "\tbuild\tvcs.modified=false" in lines, "staging binary revision mismatch"' "$(git rev-parse HEAD)"
+  python3 -c 'import sys; lines=sys.stdin.read().splitlines(); expected=sys.argv[1]; assert "\tbuild\tvcs.revision="+expected in lines and "\tbuild\tvcs.modified=false" in lines, "staging binary revision mismatch"' "$(<"$run_dir/revision")"
 docker run --rm --network none -v "$STAGING_DIR/config.yaml:/staging/config.yaml:ro" -v "$STAGING_DIR/bin:/staging/bin:ro" -v "$STAGING_DIR/derp.yaml:/staging/derp.yaml:ro" golang:1.26.5-trixie /staging/bin/headscale --config /staging/config.yaml configtest >/dev/null
 started=1
 docker compose -p "$project" -f "$compose" -f "$override" up -d >/dev/null
