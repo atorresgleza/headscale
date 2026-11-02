@@ -182,4 +182,15 @@ for attempt in $(seq 1 30); do
   sleep 1
 done
 [[ $(cat "$STAGING_DIR/secret/login.exit" 2>/dev/null) == 0 ]] || { echo 'real Tailscale login did not complete after approval' >&2; exit 1; }
-printf 'PASS one local-password-approved Tailscale software node and rejected confirmation replay\n'
+if ! docker exec "$client" tailscale --socket=/tmp/tailscaled.sock status --json \
+  >"$STAGING_DIR/secret/client-status.json" 2>"$STAGING_DIR/secret/client-status.err"; then
+  echo 'real Tailscale status command failed' >&2; exit 1
+fi
+python3 - "$STAGING_DIR/secret/client-status.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as stream:
+    status = json.load(stream)
+assert status.get('BackendState') == 'Running', 'client backend is not Running'
+assert isinstance(status.get('Self'), dict) and status['Self'].get('PublicKey'), 'client self identity unavailable'
+PY
+printf 'PASS one local-password-approved Tailscale software node, Running client and rejected confirmation replay\n'
