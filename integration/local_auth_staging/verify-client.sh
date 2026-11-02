@@ -6,7 +6,7 @@ umask 077
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 run_dir=${1:?usage: verify-client.sh FRESH_IGNORED_RUN_DIR [--invitation-shape-only]}
-if [[ $# -gt 2 || ( -n "${2-}" && "${2-}" != --invitation-shape-only ) ]]; then
+if [[ $# -gt 2 || ( $# -eq 2 && "$2" != --invitation-shape-only ) ]]; then
   echo 'usage: verify-client.sh FRESH_IGNORED_RUN_DIR [--invitation-shape-only]' >&2; exit 2
 fi
 mode=${2-}
