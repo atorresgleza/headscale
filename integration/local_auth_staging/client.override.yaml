@@ -1,0 +1,11 @@
+# Add only a private-network alias and a disposable TLS router for the client test.
+services:
+  headscale:
+    user: "${STAGING_UID}:${STAGING_GID}"
+  traefik:
+    volumes:
+      - "${STAGING_DIR}/traefik.yaml:/staging/traefik.yaml:ro"
+    networks:
+      isolated:
+        aliases:
+          - hs.aaaagen.com
