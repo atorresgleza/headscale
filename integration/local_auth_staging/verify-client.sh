@@ -290,6 +290,60 @@ print(users[0]['id'])
 PY
 )
 docker compose -p "$project" -f "$compose" -f "$override" exec -T headscale /staging/bin/headscale --config /staging/config.yaml users invite --identifier "$user_id" --origin "https://$host" -o json >"$STAGING_DIR/secret/invitation" 2>"$STAGING_DIR/secret/invite.err"
+python3 - "$STAGING_DIR/secret/invitation" "$STAGING_DIR/secret/invite.err" <<'PY'
+import base64
+import binascii
+import json
+import re
+import sys
+from pathlib import Path
+
+out, err = map(Path, sys.argv[1:3])
+try:
+    with out.open('rb') as stream:
+        stdout = stream.read(16385)
+    with err.open('rb') as stream:
+        stderr = stream.read(16385)
+except OSError:
+    sys.exit(1)
+if len(stdout) > 16384 or len(stderr) > 16384 or bool(stdout) == bool(stderr):
+    sys.exit(1)
+
+def reject_constant(_):
+    raise ValueError
+
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+
+selected = stdout if stdout else stderr
+try:
+    invitation = json.loads(selected.decode('utf-8'), parse_constant=reject_constant,
+                            object_pairs_hook=reject_duplicates)
+except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+    sys.exit(1)
+if type(invitation) is not dict or list(invitation) != ['url'] or type(invitation['url']) is not str:
+    sys.exit(1)
+url = invitation['url']
+if not re.fullmatch(r'https://hs\.aaaagen\.com/local-auth/enroll#[A-Za-z0-9_-]{43}', url):
+    sys.exit(1)
+token = url.rsplit('#', 1)[1]
+try:
+    secret = base64.b64decode(token + '=', altchars=b'-_', validate=True)
+except binascii.Error:
+    sys.exit(1)
+if len(secret) != 32 or base64.urlsafe_b64encode(secret).rstrip(b'=').decode() != token:
+    sys.exit(1)
+if stderr:
+    try:
+        out.write_bytes(selected)
+    except OSError:
+        sys.exit(1)
+PY
 printf 'isolated-staging-password-only-2026\n' >"$STAGING_DIR/secret/password"
 docker exec "$flow" node /staging/client-flow.cjs enroll
 printf 'PASS staging-only user credential enrolled without exporting invitation\n'
