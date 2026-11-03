@@ -89,7 +89,8 @@ func newInviteUserCmd() *cobra.Command {
 		Short:   "Issue or renew a local password invitation",
 		Long: "Issue a one-time local password invitation for an existing user. " +
 			"The HTTPS link is displayed once and must be delivered privately. " +
-			"Enrollment is not available until the T2d page is implemented; do not send or deploy this link yet.",
+			"Enrollment requires enabled local authentication and a trusted HTTPS reverse proxy; " +
+			"verify the deployment before delivering an invitation.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts, err := invitationOptions(cmd)

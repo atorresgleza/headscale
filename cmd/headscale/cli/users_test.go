@@ -174,4 +174,6 @@ func TestInviteUserPreservesCreateCommand(t *testing.T) {
 	require.Same(t, inviteUserCmd, invite)
 	require.Equal(t, "invite", invite.Name())
 	require.Contains(t, invite.Short, "password invitation")
+	require.Contains(t, invite.Long, "Enrollment requires enabled local authentication")
+	require.NotContains(t, invite.Long, "not available until")
 }
