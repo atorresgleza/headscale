@@ -173,7 +173,10 @@ PY
 )
   docker compose -p "$project" -f "$compose" -f "$override" exec -T headscale /staging/bin/headscale --config /staging/config.yaml users invite --identifier "$user_id" --origin "https://$host" -o json >"$STAGING_DIR/secret/invitation" 2>"$STAGING_DIR/secret/invite.err"
   python3 - "$STAGING_DIR/secret/invitation" "$STAGING_DIR/secret/invite.err" "$run_dir/invitation-shape.json" <<'PY'
+import base64
+import binascii
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -185,10 +188,10 @@ oversized = len(raw) > 16384
 kind = 'invalid'
 valid = False
 sole_url_string = False
+def reject_constant(_):
+    raise ValueError
 if not oversized:
     try:
-        def reject_constant(_):
-            raise ValueError
         document = json.loads(raw.decode('utf-8'), parse_constant=reject_constant)
         valid = True
         kind = ('object' if type(document) is dict else
@@ -197,6 +200,46 @@ if not oversized:
                            and type(document['url']) is str)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         pass
+
+def invitation_url(value):
+    if not re.fullmatch(r'https://hs\.aaaagen\.com/local-auth/enroll#[A-Za-z0-9_-]{43}', value):
+        return False
+    token = value.rsplit('#', 1)[1]
+    try:
+        secret = base64.b64decode(token + '=', altchars=b'-_', validate=True)
+    except binascii.Error:
+        return False
+    return len(secret) == 32 and base64.urlsafe_b64encode(secret).rstrip(b'=').decode() == token
+
+def json_invitation(value):
+    try:
+        parsed = json.loads(value, parse_constant=reject_constant)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return (type(parsed) is dict and list(parsed) == ['url']
+            and type(parsed['url']) is str and invitation_url(parsed['url']))
+
+stderr_format = 'empty'
+if private_stderr:
+    stderr_format = 'oversized' if len(private_stderr) > 16384 else 'other'
+    if stderr_format == 'other':
+        try:
+            text = private_stderr.decode('utf-8')
+        except UnicodeDecodeError:
+            pass
+        else:
+            if json_invitation(text):
+                stderr_format = 'json-only'
+            else:
+                lines = text.splitlines()
+                matches = [('link' if invitation_url(line) else
+                            'json' if json_invitation(line) else '') for line in lines]
+                found = [kind for kind in matches if kind]
+                if len(found) > 1:
+                    stderr_format = 'ambiguous'
+                elif found:
+                    stderr_format = (found[0] + '-only' if len(lines) == 1
+                                     else 'mixed-' + found[0])
 shape = {
     'json_valid': valid,
     'line_count_capped': min(len(raw.splitlines()), 100),
@@ -206,6 +249,7 @@ shape = {
     'invite_stderr_present': bool(private_stderr),
     'invite_stderr_line_count_capped': min(len(private_stderr.splitlines()), 100),
     'invite_stderr_over_limit': len(private_stderr) > 16384,
+    'invite_stderr_format': stderr_format,
 }
 Path(sys.argv[3]).write_text(json.dumps(shape, sort_keys=True) + '\n')
 if not sole_url_string:
