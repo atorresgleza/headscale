@@ -1,6 +1,6 @@
 # Local auth fork rollout
 Scope: publish to the owner's fork only; preserve live services and obtain concrete canary decisions before mutation.
-Status: planning; isolated software-client T4 passed, but production/Windows/UDP evidence is separate.
+Status: fork feature branch published; isolated software-client T4 passed, but production/Windows/UDP evidence is separate.
 
 ## Specs
 S1. User: "las tres, puedes seguir el plan, solo no le hagas push al proyecto principal, mantenlo en nuestro repo"
@@ -9,7 +9,7 @@ S3. User: "ass el push en la pc local y lo haces pull en el host, claro tienes q
 
 ## Tasks
 R1 [S1-S2] route: inline — align release-facing docs and CLI help with bounded T4 evidence; commit: c6ab5480a123fd3dbcc643dec78b15bfe187fd78 (done; Go CLI tests not run, explicitly accepted).
-R2 [S1,S3] route: inline — transfer exact host commit objects to the local PC without changing its dirty worktree; publish only the fork feature ref from the local PC and fast-forward sync the host; commit: pending.
+R2 [S1,S3] route: inline — transfer exact host commit objects to the local PC without changing its dirty worktree; publish only the fork feature ref from the local PC and fast-forward sync the host; commit: 60846db99d99489fb2855b174aec904c58a078e3 (published; evidence follow-up).
 R3 [S1] route: decision — identify an isolated public-PKI/proxy preproduction target without touching live services; commit: none.
 R4 [S1] route: decision — confirm live target, backup/rollback, recipient and private delivery channel before canary; commit: none.
 R5 [S1-S2] route: pending — execute a separately scoped reversible canary; commit: pending.
@@ -31,3 +31,4 @@ L12. User selected: "Accept missing CLI-test proof; publish to my fork only". Th
 L13. Work-unit commit `c6ab5480a123fd3dbcc643dec78b15bfe187fd78` contains exactly the five release-facing help/test/documentation edits plus this rollout task document. `git diff --check` and bounded structural checks passed; the owner explicitly accepted missing Go CLI test proof. The branch was clean immediately after commit. R1 is complete for release text only, not a claim of production readiness; publish is a separate R2 action.
 L14. One authorized fork-only `git push --porcelain` of exact local commit `2347d4533d8640e8e9cf431812937a39522fa17b` to `https://github.com/atorresgleza/headscale.git` `refs/heads/feature/local-password-auth` failed with exit 128: `fatal: could not read Username for 'https://github.com': No such device or address`. A fresh read-only `ls-remote` confirmed the fork branch remains at `66ced180160fd1ff34f3825b1e692412bdbe6b47`; nothing was published. R2 waits for owner-configured authentication on 4ADO; no credentials, alternate remote, force push or automatic retry were attempted.
 L15. User: "ass el push en la pc local y lo haces pull en el host, claro tienes que tertte los cambios que hisistes en el host". Use the already configured local `fork` remote pointing to the owner's fork; `origin` on the local PC points to the upstream project and must never be pushed. Preserve the local PC's unrelated dirty `odd/tasks/local-password-auth.md` while importing Git objects. Commit this host-side failed-push evidence before transfer; after publication, sync the host with fast-forward only and record the observed remote commit without overstating production readiness.
+L16. Host evidence commit `60846db99d99489fb2855b174aec904c58a078e3` was fetched into the local PC's Git object database without changing its HEAD (`66ced180`) or the unrelated dirty `odd/tasks/local-password-auth.md` blob. Local `fork` points to `https://github.com/atorresgleza/headscale.git`, while local `origin` points to upstream and was never pushed. A fresh remote check confirmed fast-forward ancestry; one explicit local push advanced only `refs/heads/feature/local-password-auth` on the owner's fork from `66ced180` to `60846db9`. Independent `ls-remote` verified the new tip. On 4ADO, `git pull --ff-only origin feature/local-password-auth` fetched the same fork tip and reported already up to date; host HEAD was `60846db9` and clean. This follow-up evidence commit itself must also be transferred through the same fork-only route before R2 closure. No upstream push, PR, merge, live deployment or invitation delivery occurred.
