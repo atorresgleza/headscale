@@ -190,9 +190,17 @@ valid = False
 sole_url_string = False
 def reject_constant(_):
     raise ValueError
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
 if not oversized:
     try:
-        document = json.loads(raw.decode('utf-8'), parse_constant=reject_constant)
+        document = json.loads(raw.decode('utf-8'), parse_constant=reject_constant,
+                              object_pairs_hook=reject_duplicates)
         valid = True
         kind = ('object' if type(document) is dict else
                 'array' if type(document) is list else 'scalar')
@@ -213,7 +221,8 @@ def invitation_url(value):
 
 def json_invitation(value):
     try:
-        parsed = json.loads(value, parse_constant=reject_constant)
+        parsed = json.loads(value, parse_constant=reject_constant,
+                            object_pairs_hook=reject_duplicates)
     except (json.JSONDecodeError, ValueError):
         return False
     return (type(parsed) is dict and list(parsed) == ['url']
