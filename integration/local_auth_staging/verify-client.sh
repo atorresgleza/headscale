@@ -206,7 +206,7 @@ if not oversized:
                 'array' if type(document) is list else 'scalar')
         sole_url_string = (type(document) is dict and list(document) == ['url']
                            and type(document['url']) is str)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
         pass
 
 def invitation_url(value):
@@ -223,7 +223,7 @@ def json_invitation(value):
     try:
         parsed = json.loads(value, parse_constant=reject_constant,
                             object_pairs_hook=reject_duplicates)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return False
     return (type(parsed) is dict and list(parsed) == ['url']
             and type(parsed['url']) is str and invitation_url(parsed['url']))
@@ -324,7 +324,7 @@ selected = stdout if stdout else stderr
 try:
     invitation = json.loads(selected.decode('utf-8'), parse_constant=reject_constant,
                             object_pairs_hook=reject_duplicates)
-except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
     sys.exit(1)
 if type(invitation) is not dict or list(invitation) != ['url'] or type(invitation['url']) is not str:
     sys.exit(1)
