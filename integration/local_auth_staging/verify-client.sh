@@ -172,13 +172,15 @@ print(users[0]['id'])
 PY
 )
   docker compose -p "$project" -f "$compose" -f "$override" exec -T headscale /staging/bin/headscale --config /staging/config.yaml users invite --identifier "$user_id" --origin "https://$host" -o json >"$STAGING_DIR/secret/invitation" 2>"$STAGING_DIR/secret/invite.err"
-  python3 - "$STAGING_DIR/secret/invitation" "$run_dir/invitation-shape.json" <<'PY'
+  python3 - "$STAGING_DIR/secret/invitation" "$STAGING_DIR/secret/invite.err" "$run_dir/invitation-shape.json" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 with open(sys.argv[1], 'rb') as stream:
     raw = stream.read(16385)
+with open(sys.argv[2], 'rb') as stream:
+    private_stderr = stream.read(16385)
 oversized = len(raw) > 16384
 kind = 'invalid'
 valid = False
@@ -201,8 +203,11 @@ shape = {
     'kind': kind,
     'sole_url_string': sole_url_string,
     'input_over_limit': oversized,
+    'invite_stderr_present': bool(private_stderr),
+    'invite_stderr_line_count_capped': min(len(private_stderr.splitlines()), 100),
+    'invite_stderr_over_limit': len(private_stderr) > 16384,
 }
-Path(sys.argv[2]).write_text(json.dumps(shape, sort_keys=True) + '\n')
+Path(sys.argv[3]).write_text(json.dumps(shape, sort_keys=True) + '\n')
 if not sole_url_string:
     sys.exit(1)
 PY
